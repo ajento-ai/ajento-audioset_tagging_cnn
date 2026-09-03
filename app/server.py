@@ -33,6 +33,10 @@ def _env_int(name: str, default: int) -> int:
 class Settings:
     model_type = os.environ.get("MODEL_TYPE", "Cnn14")
     checkpoint_path = os.environ.get("CHECKPOINT_PATH", "/models/Cnn14_mAP=0.431.pth")
+    # Optional frame-level model for the timestamped timeline/events feature.
+    sed_model_type = os.environ.get("SED_MODEL_TYPE", "Cnn14_DecisionLevelMax")
+    sed_checkpoint_path = os.environ.get(
+        "SED_CHECKPOINT_PATH", "/models/Cnn14_DecisionLevelMax_mAP=0.385.pth")
     sample_rate = _env_int("SAMPLE_RATE", 32000)
     window_size = _env_int("WINDOW_SIZE", 1024)
     hop_size = _env_int("HOP_SIZE", 320)
@@ -68,6 +72,10 @@ def _load_model() -> None:
     if ckpt is None:
         log.warning("Checkpoint %s not found; serving with RANDOM weights (dev only)",
                     settings.checkpoint_path)
+    sed_ckpt = settings.sed_checkpoint_path if os.path.exists(settings.sed_checkpoint_path) else None
+    if sed_ckpt is None:
+        log.warning("SED checkpoint %s not found; timestamped timeline/events disabled",
+                    settings.sed_checkpoint_path)
     tagger = AudioTagger(
         model_type=settings.model_type,
         checkpoint_path=ckpt,
@@ -78,8 +86,11 @@ def _load_model() -> None:
         fmin=settings.fmin,
         fmax=settings.fmax,
         num_threads=settings.num_threads,
+        sed_model_type=settings.sed_model_type,
+        sed_checkpoint_path=sed_ckpt,
     )
-    log.info("Loaded %s on %s in %.1fs", settings.model_type, tagger.device, time.time() - t0)
+    log.info("Loaded %s (+SED=%s) on %s in %.1fs", settings.model_type,
+             bool(tagger.sed_model), tagger.device, time.time() - t0)
 
 
 def require_api_key(
@@ -102,7 +113,8 @@ def labels():
 
 
 def _tag_local_file(tmp_path: str, filename: str, size: int, top_k: int, threshold: float,
-                    segment_seconds: float, include_embedding: bool, t0: float) -> dict:
+                    segment_seconds: float, include_embedding: bool, timeline_seconds: float,
+                    t0: float) -> dict:
     try:
         try:
             waveform = tagger.decode_audio(tmp_path, max_seconds=settings.max_duration_seconds)
@@ -110,6 +122,16 @@ def _tag_local_file(tmp_path: str, filename: str, size: int, top_k: int, thresho
             raise HTTPException(status_code=400, detail=str(e))
         result = tagger.tag(waveform, top_k=top_k, threshold=threshold,
                             segment_seconds=segment_seconds, include_embedding=include_embedding)
+        if timeline_seconds:
+            events_out = tagger.detect_events(waveform, bin_seconds=timeline_seconds,
+                                              top_k=min(top_k, 5), threshold=max(threshold, 0.15))
+            if events_out is None:
+                result["timeline_unavailable"] = (
+                    "Timestamped timeline is not available: the server has no "
+                    "sound event detection model loaded."
+                )
+            else:
+                result.update(events_out)
     finally:
         try:
             os.remove(tmp_path)
@@ -136,6 +158,7 @@ def config():
         "upload_max_mb": settings.upload_max_mb if settings.upload_bucket else settings.max_upload_mb,
         "max_duration_seconds": settings.max_duration_seconds,
         "default_top_k": settings.default_top_k,
+        "timeline_available": tagger is not None and tagger.sed_model is not None,
     }
 
 
@@ -147,6 +170,8 @@ async def tag_audio(
     segment_seconds: float = Form(default=0.0, ge=0.0, le=60.0,
                                   description="Also return tags per segment of this length (0 = off)"),
     include_embedding: bool = Form(default=False),
+    timeline_seconds: float = Form(default=0.0, ge=0.0, le=10.0,
+                                   description="Also return a timestamped timeline/events at this bin size in seconds (0 = off)"),
 ):
     if tagger is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
@@ -173,7 +198,7 @@ async def tag_audio(
         os.remove(tmp_path)
         raise HTTPException(status_code=400, detail="Empty upload")
     return JSONResponse(_tag_local_file(tmp_path, file.filename, size, top_k, threshold,
-                                        segment_seconds, include_embedding, t0))
+                                        segment_seconds, include_embedding, timeline_seconds, t0))
 
 
 # ---------------------------------------------------------------- large files
@@ -217,6 +242,7 @@ def tag_object(
     threshold: float = Form(default=0.0, ge=0.0, le=1.0),
     segment_seconds: float = Form(default=0.0, ge=0.0, le=60.0),
     include_embedding: bool = Form(default=False),
+    timeline_seconds: float = Form(default=0.0, ge=0.0, le=10.0),
 ):
     """Tag a file previously uploaded via /api/upload-session, then delete it."""
     if tagger is None:
@@ -242,7 +268,8 @@ def tag_object(
             pass
     size = os.path.getsize(tmp_path)
     return JSONResponse(_tag_local_file(tmp_path, filename or os.path.basename(object_name), size,
-                                        top_k, threshold, segment_seconds, include_embedding, t0))
+                                        top_k, threshold, segment_seconds, include_embedding,
+                                        timeline_seconds, t0))
 
 
 @app.get("/", include_in_schema=False)

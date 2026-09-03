@@ -131,6 +131,28 @@ Recordings longer than 60 s are processed in 10 s windows and the overall tags
 are the mean over windows (`"aggregation": "mean_over_segments"`), which keeps
 memory flat for long files.
 
+### Timestamped timeline and events
+
+A second, frame-level model (`Cnn14_DecisionLevelMax`) is baked into the image
+alongside the main one and gives a probability per class roughly every 10 ms,
+instead of one score for the whole clip. Pass `timeline_seconds` (0 to 10,
+0 = off) to `/api/tag` or `/api/tag-object` to get, on top of the normal
+result:
+
+- `timeline`: fixed-size windows of that many seconds, each with its own top
+  tags — good for scrubbing through the file.
+- `events`: discrete start/end/peak-time ranges per label wherever its
+  probability stayed above the threshold, merged across short gaps. This is
+  what answers "what happened, and when" — e.g. a `Slam` at 45.3s or `Music`
+  running from 12s to 90s.
+
+It still only names AudioSet's 527 generic classes with a timestamp (`Slam`,
+`Thud`, `Bang`, `Music`, `Speech`, ...), not a description of the scene — it
+cannot tell you "she hits wall", only that an impact-like sound happened at
+that time. Set `SED_MODEL_URL=""` at build time to skip downloading this
+second checkpoint if you don't need the feature; `GET /api/config` reports
+`timeline_available` so the UI can hide the option automatically.
+
 Other endpoints: `GET /api/config`, `GET /api/labels`, `GET /healthz`, `GET /docs` (OpenAPI UI).
 Direct uploads are capped at 32 MB, bucket uploads at 1 GB, and analysis at
 the first 30 minutes of audio (env `MAX_UPLOAD_MB`, `UPLOAD_MAX_MB`,

@@ -19,7 +19,7 @@ REPO="${REPO:-audiotagging}"
 DOMAIN="${DOMAIN-audiotagging.ajento.app}"
 MIN_INSTANCES="${MIN_INSTANCES:-0}"
 MAX_INSTANCES="${MAX_INSTANCES:-5}"
-MEMORY="${MEMORY:-4Gi}"
+MEMORY="${MEMORY:-6Gi}"  # two models loaded (tagging + timeline/events)
 CPU="${CPU:-4}"
 # Bucket for browser uploads larger than Cloud Run's 32 MiB request limit.
 # Set UPLOAD_BUCKET= (empty) to disable.

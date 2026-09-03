@@ -45,10 +45,13 @@ class AudioTagger:
         labels_csv: Optional[str] = None,
         device: Optional[str] = None,
         num_threads: Optional[int] = None,
+        sed_model_type: Optional[str] = None,
+        sed_checkpoint_path: Optional[str] = None,
     ):
         self.model_type = model_type
         self.checkpoint_path = checkpoint_path
         self.sample_rate = sample_rate
+        self.hop_size = hop_size
         labels_csv = labels_csv or os.path.join(
             REPO_ROOT, "metadata", "class_labels_indices.csv"
         )
@@ -79,6 +82,21 @@ class AudioTagger:
             self.model.load_state_dict(state)
         self.model.to(self.device)
         self.model.eval()
+
+        # Optional frame-level sound event detection model: gives a
+        # probability per class roughly every 10 ms instead of one score per
+        # clip, which is what lets /api/tag build a real timestamped timeline.
+        self.sed_model = None
+        if sed_model_type and sed_checkpoint_path and os.path.exists(sed_checkpoint_path):
+            sed_cls = getattr(panns_models, sed_model_type)
+            self.sed_model = sed_cls(
+                sample_rate=sample_rate, window_size=window_size, hop_size=hop_size,
+                mel_bins=mel_bins, fmin=fmin, fmax=fmax, classes_num=self.classes_num,
+            )
+            sed_ckpt = torch.load(sed_checkpoint_path, map_location="cpu", weights_only=False)
+            self.sed_model.load_state_dict(sed_ckpt["model"] if "model" in sed_ckpt else sed_ckpt)
+            self.sed_model.to(self.device)
+            self.sed_model.eval()
 
     # ------------------------------------------------------------------ audio
     def decode_audio(self, path: str, max_seconds: Optional[float] = None) -> np.ndarray:
@@ -145,6 +163,98 @@ class AudioTagger:
                 break
             tags.append({"index": int(idx), "label": self.labels[idx], "probability": round(p, 4)})
         return tags
+
+    @torch.no_grad()
+    def _forward_framewise(self, batch: np.ndarray) -> np.ndarray:
+        """(batch, frames, classes_num) frame-level probabilities from the SED model."""
+        x = torch.from_numpy(batch).to(self.device)
+        out = self.sed_model(x, None)
+        return out["framewise_output"].cpu().numpy()
+
+    def detect_events(
+        self,
+        waveform: np.ndarray,
+        bin_seconds: float = 1.0,
+        top_k: int = 5,
+        threshold: float = 0.15,
+        merge_gap_seconds: float = 0.5,
+        min_event_seconds: float = 0.15,
+        max_events: int = 200,
+    ) -> Optional[dict]:
+        """Timestamped tags at roughly 10 ms resolution using the frame-level
+        (sound event detection) model, if one was loaded.
+
+        Returns a fixed-size ``timeline`` of ``bin_seconds`` windows (top tags
+        per window, useful for scrubbing through the file) plus discrete
+        ``events``: per-label runs where the frame probability stays above
+        ``threshold``, merged across gaps shorter than ``merge_gap_seconds``
+        and dropped if shorter than ``min_event_seconds``. Events still only
+        name AudioSet classes (e.g. "Slam", "Thud", "Music") with a timestamp,
+        not a description of what caused the sound.
+        """
+        if self.sed_model is None:
+            return None
+
+        duration = waveform.shape[0] / self.sample_rate
+        framewise = self._forward_framewise(waveform[None, :])[0]  # (frames, classes)
+        frames_per_second = self.sample_rate / self.hop_size
+        n_frames = framewise.shape[0]
+
+        bin_frames = max(1, int(round(bin_seconds * frames_per_second)))
+        n_bins = int(np.ceil(n_frames / bin_frames))
+        timeline = []
+        for b in range(n_bins):
+            start_f, end_f = b * bin_frames, min((b + 1) * bin_frames, n_frames)
+            window_probs = framewise[start_f:end_f].max(axis=0)
+            timeline.append({
+                "start": round(start_f / frames_per_second, 2),
+                "end": round(min(end_f / frames_per_second, duration), 2),
+                "tags": self._top_k(window_probs, top_k, threshold),
+            })
+
+        gap_frames = max(1, int(round(merge_gap_seconds * frames_per_second)))
+        above = framewise >= threshold
+        events = []
+        for class_idx in range(framewise.shape[1]):
+            hits = np.flatnonzero(above[:, class_idx])
+            if hits.size == 0:
+                continue
+            run_start = prev = int(hits[0])
+            runs = []
+            for i in hits[1:]:
+                i = int(i)
+                if i - prev <= gap_frames:
+                    prev = i
+                else:
+                    runs.append((run_start, prev))
+                    run_start = prev = i
+            runs.append((run_start, prev))
+            for start_f, end_f in runs:
+                if (end_f - start_f + 1) / frames_per_second < min_event_seconds:
+                    continue
+                segment = framewise[start_f : end_f + 1, class_idx]
+                peak_f = start_f + int(np.argmax(segment))
+                # start_f/end_f/peak_f are now plain Python ints, so every
+                # derived value below is a plain float, not numpy.float64
+                # (which json.dumps cannot serialize).
+                events.append({
+                    "label": self.labels[class_idx],
+                    "index": class_idx,
+                    "start": round(start_f / frames_per_second, 2),
+                    "end": round(min((end_f + 1) / frames_per_second, duration), 2),
+                    "peak_time": round(peak_f / frames_per_second, 2),
+                    "peak_probability": round(float(framewise[peak_f, class_idx]), 4),
+                })
+
+        if len(events) > max_events:
+            events = sorted(events, key=lambda e: -e["peak_probability"])[:max_events]
+        events.sort(key=lambda e: e["start"])
+
+        return {
+            "frames_per_second": round(frames_per_second, 2),
+            "timeline": timeline,
+            "events": events,
+        }
 
     def tag(
         self,
