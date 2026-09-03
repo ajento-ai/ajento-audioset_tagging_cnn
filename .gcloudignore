@@ -1,0 +1,15 @@
+# Controls what `gcloud builds submit` uploads (otherwise .gitignore is used,
+# and this repo's .gitignore excludes extension-less files such as Dockerfile).
+.git
+.gitignore
+*.pth
+*.hdf5
+*.h5
+__pycache__
+*.pyc
+_logs
+paper_statistics
+resources/*.pdf
+resources/*.png
+venv
+.venv
