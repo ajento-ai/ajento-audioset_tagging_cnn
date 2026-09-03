@@ -25,6 +25,7 @@
   .bar { height: 8px; background: var(--bar); border-radius: 4px; overflow: hidden; margin-top: 4px; }
   .bar > i { display: block; height: 100%; background: var(--accent); }
   .prob { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .help { color: var(--muted); font-size: 12px; margin-top: 4px; max-width: 170px; }
   .meta { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
   .seg { margin-top: 14px; }
   .seg summary { cursor: pointer; color: var(--muted); }
@@ -48,10 +49,9 @@
     </label>
     <audio id="player" controls hidden></audio>
     <div class="row">
-      <div><label>Top K</label><input type="number" id="topk" value="10" min="1" max="527"></div>
-      <div><label>Min probability</label><input type="number" id="thr" value="0.0" min="0" max="1" step="0.01"></div>
-      <div><label>Per-segment (sec, 0 = off)</label><input type="number" id="seg" value="10" min="0" max="60" step="1"></div>
-      <div><label>API key (if required)</label><input type="password" id="key" style="width:160px" placeholder="optional"></div>
+      <div><label>Top K</label><input type="number" id="topk" value="10" min="1" max="527"><div class="help">How many labels to show, best first (527 possible)</div></div>
+      <div><label>Min probability</label><input type="number" id="thr" value="0.0" min="0" max="1" step="0.01"><div class="help">Hide labels scoring below this (0 = show all)</div></div>
+      <div><label>Per-segment (sec)</label><input type="number" id="seg" value="10" min="0" max="60" step="1"><div class="help">Also tag each N-second window (0 = whole file only)</div></div>
       <div><button id="go" disabled>Analyze</button></div>
     </div>
   </div>
@@ -63,15 +63,9 @@
     <details class="seg"><summary>Raw JSON</summary><pre id="json"></pre></details>
   </div>
 
-  <div class="card">
-    <div class="meta">API</div>
-    <pre>curl -F "file=@clip.mp3" -F top_k=5 -F segment_seconds=10 <span id="origin"></span>/api/tag</pre>
-    <div class="meta">Interactive docs at <a href="/docs" style="color:var(--accent)">/docs</a>.</div>
-  </div>
 </main>
 <script>
   const $ = id => document.getElementById(id);
-  $('origin').textContent = location.origin;
   let selected = null;
   const drop = $('drop'), fileInput = $('file');
   function setFile(f) {
@@ -95,9 +89,8 @@
     fd.append('top_k', $('topk').value);
     fd.append('threshold', $('thr').value);
     fd.append('segment_seconds', $('seg').value);
-    const headers = {}; if ($('key').value) headers['X-API-Key'] = $('key').value;
     try {
-      const r = await fetch('/api/tag', { method: 'POST', body: fd, headers });
+      const r = await fetch('/api/tag', { method: 'POST', body: fd });
       const data = await r.json();
       $('result').hidden = false;
       if (!r.ok) { $('meta').innerHTML = `<span class="err">Error ${r.status}: ${data.detail || JSON.stringify(data)}</span>`; $('tags').innerHTML=''; $('segments').hidden = true; $('json').textContent = JSON.stringify(data, null, 2); return; }
