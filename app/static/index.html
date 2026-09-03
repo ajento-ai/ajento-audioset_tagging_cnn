@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ajento Audio Tagging</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --fg:#e8eaf0; --muted:#8a90a2; --accent:#5b8cff; --bar:#2a2f3a; }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width: 760px; margin: 40px auto; padding: 0 20px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin-bottom: 28px; }
+  .card { background: var(--card); border-radius: 12px; padding: 22px; margin-bottom: 20px; }
+  .drop { border: 2px dashed #3a4050; border-radius: 10px; padding: 36px; text-align: center; cursor: pointer; transition: border-color .15s; }
+  .drop.over { border-color: var(--accent); }
+  .drop input { display: none; }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 16px; align-items: end; }
+  label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 4px; }
+  input[type=number], select { background:#0f1115; color:var(--fg); border:1px solid #2a2f3a; border-radius:6px; padding:8px 10px; width: 120px; }
+  button { background: var(--accent); color: white; border: 0; border-radius: 8px; padding: 10px 18px; font-size: 15px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .tag { display: grid; grid-template-columns: 1fr 70px; align-items: center; gap: 12px; padding: 6px 0; border-bottom: 1px solid #22262f; }
+  .tag:last-child { border-bottom: 0; }
+  .bar { height: 8px; background: var(--bar); border-radius: 4px; overflow: hidden; margin-top: 4px; }
+  .bar > i { display: block; height: 100%; background: var(--accent); }
+  .prob { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .meta { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+  .seg { margin-top: 14px; }
+  .seg summary { cursor: pointer; color: var(--muted); }
+  .segrow { display:flex; gap:10px; padding:4px 0; font-size: 14px; }
+  .segrow .t { color: var(--muted); width: 110px; flex: none; font-variant-numeric: tabular-nums; }
+  pre { background:#0f1115; padding:12px; border-radius:8px; overflow:auto; font-size:12px; max-height: 320px; }
+  .err { color: #ff7b7b; }
+  audio { width: 100%; margin-top: 12px; }
+  code { background:#0f1115; padding:2px 6px; border-radius:4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Audio Tagging</h1>
+  <div class="sub">Upload an audio file and get AudioSet labels (527 classes) from a PANNs Cnn14 model.</div>
+
+  <div class="card">
+    <label class="drop" id="drop">
+      <input type="file" id="file" accept="audio/*,video/*,.wav,.mp3,.m4a,.flac,.ogg,.webm,.aac,.opus">
+      <div id="dropText">Drop an audio file here or click to choose<br><small style="color:var(--muted)">wav, mp3, m4a, flac, ogg, webm …</small></div>
+    </label>
+    <audio id="player" controls hidden></audio>
+    <div class="row">
+      <div><label>Top K</label><input type="number" id="topk" value="10" min="1" max="527"></div>
+      <div><label>Min probability</label><input type="number" id="thr" value="0.0" min="0" max="1" step="0.01"></div>
+      <div><label>Per-segment (sec, 0 = off)</label><input type="number" id="seg" value="10" min="0" max="60" step="1"></div>
+      <div><label>API key (if required)</label><input type="password" id="key" style="width:160px" placeholder="optional"></div>
+      <div><button id="go" disabled>Analyze</button></div>
+    </div>
+  </div>
+
+  <div class="card" id="result" hidden>
+    <div class="meta" id="meta"></div>
+    <div id="tags"></div>
+    <details class="seg" id="segments" hidden><summary>Per-segment tags</summary><div id="segbody"></div></details>
+    <details class="seg"><summary>Raw JSON</summary><pre id="json"></pre></details>
+  </div>
+
+  <div class="card">
+    <div class="meta">API</div>
+    <pre>curl -F "file=@clip.mp3" -F top_k=5 -F segment_seconds=10 <span id="origin"></span>/api/tag</pre>
+    <div class="meta">Interactive docs at <a href="/docs" style="color:var(--accent)">/docs</a>.</div>
+  </div>
+</main>
+<script>
+  const $ = id => document.getElementById(id);
+  $('origin').textContent = location.origin;
+  let selected = null;
+  const drop = $('drop'), fileInput = $('file');
+  function setFile(f) {
+    selected = f; $('go').disabled = !f;
+    $('dropText').innerHTML = f ? `<b>${f.name}</b> <small style="color:var(--muted)">(${(f.size/1048576).toFixed(2)} MB)</small>` : 'Drop an audio file here or click to choose';
+    const p = $('player'); if (f) { p.src = URL.createObjectURL(f); p.hidden = false; } else p.hidden = true;
+  }
+  fileInput.addEventListener('change', () => setFile(fileInput.files[0]));
+  ['dragenter','dragover'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave','drop'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', ev => { if (ev.dataTransfer.files[0]) setFile(ev.dataTransfer.files[0]); });
+
+  function renderTags(el, tags) {
+    el.innerHTML = tags.map(t => `<div class="tag"><div>${t.label}<div class="bar"><i style="width:${(t.probability*100).toFixed(1)}%"></i></div></div><div class="prob">${t.probability.toFixed(3)}</div></div>`).join('') || '<div class="meta">No tags above threshold.</div>';
+  }
+  $('go').addEventListener('click', async () => {
+    if (!selected) return;
+    const btn = $('go'); btn.disabled = true; btn.textContent = 'Analyzing…';
+    const fd = new FormData();
+    fd.append('file', selected);
+    fd.append('top_k', $('topk').value);
+    fd.append('threshold', $('thr').value);
+    fd.append('segment_seconds', $('seg').value);
+    const headers = {}; if ($('key').value) headers['X-API-Key'] = $('key').value;
+    try {
+      const r = await fetch('/api/tag', { method: 'POST', body: fd, headers });
+      const data = await r.json();
+      $('result').hidden = false;
+      if (!r.ok) { $('meta').innerHTML = `<span class="err">Error ${r.status}: ${data.detail || JSON.stringify(data)}</span>`; $('tags').innerHTML=''; $('segments').hidden = true; $('json').textContent = JSON.stringify(data, null, 2); return; }
+      $('meta').textContent = `${data.filename} · ${data.duration_seconds}s audio · ${data.model} · processed in ${data.processing_seconds}s` + (data.truncated_to_seconds ? ` · truncated to first ${data.truncated_to_seconds}s` : '');
+      renderTags($('tags'), data.tags);
+      if (data.segments) {
+        $('segments').hidden = false;
+        $('segbody').innerHTML = data.segments.map(s => `<div class="segrow"><span class="t">${s.start}s – ${s.end}s</span><span>${s.tags.slice(0,3).map(t => `${t.label} (${t.probability.toFixed(2)})`).join(', ')}</span></div>`).join('');
+      } else $('segments').hidden = true;
+      $('json').textContent = JSON.stringify(data, null, 2);
+    } catch (e) {
+      $('result').hidden = false; $('meta').innerHTML = `<span class="err">${e}</span>`;
+    } finally { btn.disabled = false; btn.textContent = 'Analyze'; }
+  });
+</script>
+</body>
+</html>

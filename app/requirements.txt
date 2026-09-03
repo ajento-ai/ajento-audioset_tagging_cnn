@@ -1,0 +1,9 @@
+# Runtime dependencies for the web service (CPU inference).
+# torch is installed separately in the Dockerfile from the CPU wheel index.
+torchlibrosa==0.1.0
+numpy>=1.26,<3
+soundfile>=0.12
+librosa>=0.10
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
