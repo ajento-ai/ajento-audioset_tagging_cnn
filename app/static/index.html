@@ -66,9 +66,15 @@
 </main>
 <script>
   const $ = id => document.getElementById(id);
+  const MAX_MB = 32; // Cloud Run request body limit
   let selected = null;
   const drop = $('drop'), fileInput = $('file');
   function setFile(f) {
+    if (f && f.size > MAX_MB * 1048576) {
+      $('result').hidden = false; $('tags').innerHTML=''; $('segments').hidden = true; $('json').textContent='';
+      $('meta').innerHTML = `<span class="err">${f.name} is ${(f.size/1048576).toFixed(1)} MB. Files must be under ${MAX_MB} MB. Trim the clip or export it as MP3/M4A and try again.</span>`;
+      f = null; fileInput.value = '';
+    }
     selected = f; $('go').disabled = !f;
     $('dropText').innerHTML = f ? `<b>${f.name}</b> <small style="color:var(--muted)">(${(f.size/1048576).toFixed(2)} MB)</small>` : 'Drop an audio file here or click to choose';
     const p = $('player'); if (f) { p.src = URL.createObjectURL(f); p.hidden = false; } else p.hidden = true;
@@ -91,7 +97,10 @@
     fd.append('segment_seconds', $('seg').value);
     try {
       const r = await fetch('/api/tag', { method: 'POST', body: fd });
-      const data = await r.json();
+      const text = await r.text();
+      let data;
+      try { data = JSON.parse(text); }
+      catch { data = { detail: r.status === 413 ? `File too large (limit ${MAX_MB} MB).` : (r.status === 504 || r.status === 502 ? 'The server took too long or was unavailable. Try a shorter clip.' : text.replace(/<[^>]+>/g, ' ').trim().slice(0, 200)) }; }
       $('result').hidden = false;
       if (!r.ok) { $('meta').innerHTML = `<span class="err">Error ${r.status}: ${data.detail || JSON.stringify(data)}</span>`; $('tags').innerHTML=''; $('segments').hidden = true; $('json').textContent = JSON.stringify(data, null, 2); return; }
       $('meta').textContent = `${data.filename} · ${data.duration_seconds}s audio · ${data.model} · processed in ${data.processing_seconds}s` + (data.truncated_to_seconds ? ` · truncated to first ${data.truncated_to_seconds}s` : '');

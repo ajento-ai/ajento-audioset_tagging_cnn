@@ -52,7 +52,7 @@ echo "==> Building image with Cloud Build (downloads the ~330 MB checkpoint; tak
 gcloud builds submit --config deploy/cloudbuild.yaml "${BUILD_SA_FLAG[@]}" \
   --substitutions="_REGION=${REGION},_REPO=${REPO},_IMAGE=${SERVICE},SHORT_SHA=$(git rev-parse --short HEAD 2>/dev/null || date +%s)" .
 
-ENV_VARS="MODEL_TYPE=Cnn14,MAX_UPLOAD_MB=100,MAX_DURATION_SECONDS=600,TORCH_NUM_THREADS=${CPU}"
+ENV_VARS="MODEL_TYPE=Cnn14,MAX_UPLOAD_MB=32,MAX_DURATION_SECONDS=600,TORCH_NUM_THREADS=${CPU}"
 if [[ -n "${API_KEY:-}" ]]; then ENV_VARS="${ENV_VARS},API_KEY=${API_KEY}"; fi
 
 # --no-invoker-iam-check makes the service public without an allUsers IAM

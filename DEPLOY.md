@@ -119,8 +119,8 @@ Form fields for `POST /api/tag`:
 | `include_embedding` | false   | Return the 2048-d clip embedding                     |
 
 Other endpoints: `GET /api/labels`, `GET /healthz`, `GET /docs` (OpenAPI UI).
-Uploads are capped at 100 MB and the first 600 s of audio (env
-`MAX_UPLOAD_MB`, `MAX_DURATION_SECONDS`).
+Uploads are capped at 32 MB (Cloud Run's request body limit for HTTP/1) and
+the first 600 s of audio (env `MAX_UPLOAD_MB`, `MAX_DURATION_SECONDS`).
 
 ## Running locally
 
@@ -157,6 +157,6 @@ Set Docker build args `MODEL_URL` / `MODEL_FILE` and runtime env
 - Scale-to-zero costs nothing idle but the first request after idle waits
   ~20 s for the model to load. `MIN_INSTANCES=1` removes that for roughly
   $50 per month.
-- Cloud Run has a 32 MiB request limit only for HTTP/1 without chunking; file
-  uploads up to the `MAX_UPLOAD_MB` limit work over HTTP/2, which Cloud Run
-  uses by default.
+- Cloud Run rejects request bodies over 32 MiB with an HTML 413 page before
+  the app sees them. A 32 MB MP3 is roughly 30 minutes of audio, well above
+  the 600 s the service analyses, so compress long recordings before upload.
