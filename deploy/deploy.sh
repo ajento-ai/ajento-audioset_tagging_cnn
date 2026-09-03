@@ -37,8 +37,19 @@ if ! gcloud artifacts repositories describe "${REPO}" --location="${REGION}" >/d
     --description="Audio tagging service images"
 fi
 
+# Newer projects give the default compute service account no roles, which makes
+# Cloud Build fail with "does not have storage.objects.get access". Fix once with:
+#   gcloud projects add-iam-policy-binding $PROJECT_ID \
+#     --member serviceAccount:$(gcloud projects describe $PROJECT_ID --format='value(projectNumber)')-compute@developer.gserviceaccount.com \
+#     --role roles/cloudbuild.builds.builder
+# or set BUILD_SERVICE_ACCOUNT to a user-managed SA that has that role.
+BUILD_SA_FLAG=()
+if [[ -n "${BUILD_SERVICE_ACCOUNT:-}" ]]; then
+  BUILD_SA_FLAG=(--service-account="projects/${PROJECT_ID}/serviceAccounts/${BUILD_SERVICE_ACCOUNT}")
+fi
+
 echo "==> Building image with Cloud Build (downloads the ~330 MB checkpoint; takes several minutes)"
-gcloud builds submit --config deploy/cloudbuild.yaml \
+gcloud builds submit --config deploy/cloudbuild.yaml "${BUILD_SA_FLAG[@]}" \
   --substitutions="_REGION=${REGION},_REPO=${REPO},_IMAGE=${SERVICE},SHORT_SHA=$(git rev-parse --short HEAD 2>/dev/null || date +%s)" .
 
 ENV_VARS="MODEL_TYPE=Cnn14,MAX_UPLOAD_MB=100,MAX_DURATION_SECONDS=600,TORCH_NUM_THREADS=${CPU}"
