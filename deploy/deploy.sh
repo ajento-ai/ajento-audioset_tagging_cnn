@@ -55,12 +55,14 @@ gcloud builds submit --config deploy/cloudbuild.yaml "${BUILD_SA_FLAG[@]}" \
 ENV_VARS="MODEL_TYPE=Cnn14,MAX_UPLOAD_MB=100,MAX_DURATION_SECONDS=600,TORCH_NUM_THREADS=${CPU}"
 if [[ -n "${API_KEY:-}" ]]; then ENV_VARS="${ENV_VARS},API_KEY=${API_KEY}"; fi
 
+# --no-invoker-iam-check makes the service public without an allUsers IAM
+# binding, which organizations with domain-restricted sharing reject.
 echo "==> Deploying to Cloud Run"
 gcloud run deploy "${SERVICE}" \
   --image="${IMAGE}:latest" \
   --region="${REGION}" \
   --platform=managed \
-  --allow-unauthenticated \
+  --no-invoker-iam-check \
   --port=8080 \
   --memory="${MEMORY}" --cpu="${CPU}" \
   --concurrency=2 \

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -)",
+      "Bash(bash -n deploy/deploy.sh)",
+      "Bash(git add *)",
+      "Bash(git commit -q -m 'deploy.sh: expose service with --no-invoker-iam-check *)",
+      "Bash(git push *)"
+    ]
+  }
+}
