@@ -11,7 +11,10 @@ import tempfile
 import time
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
+import uuid
+
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from pydantic import BaseModel
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -42,6 +45,12 @@ class Settings:
     num_threads = _env_int("TORCH_NUM_THREADS", 0) or None
     # If set, requests to /api/* must carry it in the X-API-Key header or ?key=
     api_key: Optional[str] = os.environ.get("API_KEY") or None
+    # If set, browsers can upload large files straight to this GCS bucket and
+    # then call /api/tag-object. Bypasses Cloud Run's 32 MiB request limit.
+    upload_bucket: Optional[str] = os.environ.get("UPLOAD_BUCKET") or None
+    upload_max_mb = _env_int("UPLOAD_MAX_MB", 1024)
+    # Files above this size go through the bucket in the browser UI.
+    direct_upload_max_mb = _env_int("DIRECT_UPLOAD_MAX_MB", 25)
 
 
 settings = Settings()
@@ -92,6 +101,44 @@ def labels():
     return {"count": tagger.classes_num, "labels": tagger.labels}
 
 
+def _tag_local_file(tmp_path: str, filename: str, size: int, top_k: int, threshold: float,
+                    segment_seconds: float, include_embedding: bool, t0: float) -> dict:
+    try:
+        try:
+            waveform = tagger.decode_audio(tmp_path, max_seconds=settings.max_duration_seconds)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        result = tagger.tag(waveform, top_k=top_k, threshold=threshold,
+                            segment_seconds=segment_seconds, include_embedding=include_embedding)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    result["filename"] = filename
+    result["truncated_to_seconds"] = (
+        settings.max_duration_seconds
+        if result["duration_seconds"] >= settings.max_duration_seconds - 0.05 else None
+    )
+    result["processing_seconds"] = round(time.time() - t0, 3)
+    log.info("tagged %s (%.1fs audio, %d bytes) in %.2fs -> %s",
+             filename, result["duration_seconds"], size, result["processing_seconds"],
+             result["tags"][0]["label"] if result["tags"] else "-")
+    return result
+
+
+@app.get("/api/config")
+def config():
+    return {
+        "direct_upload_max_mb": min(settings.max_upload_mb, settings.direct_upload_max_mb)
+        if settings.upload_bucket else settings.max_upload_mb,
+        "bucket_upload": settings.upload_bucket is not None,
+        "upload_max_mb": settings.upload_max_mb if settings.upload_bucket else settings.max_upload_mb,
+        "max_duration_seconds": settings.max_duration_seconds,
+        "default_top_k": settings.default_top_k,
+    }
+
+
 @app.post("/api/tag", dependencies=[Depends(require_api_key)])
 async def tag_audio(
     file: UploadFile = File(..., description="Audio file (wav, mp3, m4a, flac, ogg, webm...)"),
@@ -125,30 +172,77 @@ async def tag_audio(
     if size == 0:
         os.remove(tmp_path)
         raise HTTPException(status_code=400, detail="Empty upload")
+    return JSONResponse(_tag_local_file(tmp_path, file.filename, size, top_k, threshold,
+                                        segment_seconds, include_embedding, t0))
 
+
+# ---------------------------------------------------------------- large files
+class UploadSessionRequest(BaseModel):
+    filename: str
+    content_type: str = "application/octet-stream"
+    size: int
+
+
+def _gcs_bucket():
+    if not settings.upload_bucket:
+        raise HTTPException(status_code=404, detail="Bucket uploads are not enabled")
+    from google.cloud import storage  # imported lazily; optional dependency
+    return storage.Client().bucket(settings.upload_bucket)
+
+
+@app.post("/api/upload-session", dependencies=[Depends(require_api_key)])
+def create_upload_session(req: UploadSessionRequest, request: Request):
+    """Start a resumable GCS upload the browser can PUT the file to directly."""
+    if req.size <= 0 or req.size > settings.upload_max_mb * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File exceeds {settings.upload_max_mb} MB limit")
+    suffix = os.path.splitext(req.filename or "")[1][:10]
+    object_name = f"uploads/{uuid.uuid4().hex}{suffix}"
+    blob = _gcs_bucket().blob(object_name)
+    origin = request.headers.get("origin")
     try:
-        try:
-            waveform = tagger.decode_audio(tmp_path, max_seconds=settings.max_duration_seconds)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        result = tagger.tag(waveform, top_k=top_k, threshold=threshold,
-                            segment_seconds=segment_seconds, include_embedding=include_embedding)
+        url = blob.create_resumable_upload_session(
+            content_type=req.content_type or "application/octet-stream",
+            size=req.size, origin=origin)
+    except Exception as e:  # surfaces missing IAM etc. as a clean 500
+        log.exception("could not create upload session")
+        raise HTTPException(status_code=500, detail=f"Could not start upload: {e}")
+    return {"object": object_name, "upload_url": url}
+
+
+@app.post("/api/tag-object", dependencies=[Depends(require_api_key)])
+def tag_object(
+    object_name: str = Form(..., alias="object"),
+    filename: str = Form(default=""),
+    top_k: int = Form(default=None, ge=1, le=527),
+    threshold: float = Form(default=0.0, ge=0.0, le=1.0),
+    segment_seconds: float = Form(default=0.0, ge=0.0, le=60.0),
+    include_embedding: bool = Form(default=False),
+):
+    """Tag a file previously uploaded via /api/upload-session, then delete it."""
+    if tagger is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet")
+    if not object_name.startswith("uploads/") or "/" in object_name[len("uploads/"):]:
+        raise HTTPException(status_code=400, detail="Invalid object name")
+    top_k = top_k or settings.default_top_k
+    t0 = time.time()
+    blob = _gcs_bucket().blob(object_name)
+    suffix = os.path.splitext(object_name)[1] or ".bin"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        blob.download_to_filename(tmp_path)
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise HTTPException(status_code=404, detail=f"Uploaded file not found: {e}")
     finally:
         try:
-            os.remove(tmp_path)
-        except OSError:
+            blob.delete()
+        except Exception:
             pass
-
-    result["filename"] = file.filename
-    result["truncated_to_seconds"] = (
-        settings.max_duration_seconds
-        if result["duration_seconds"] >= settings.max_duration_seconds - 0.05 else None
-    )
-    result["processing_seconds"] = round(time.time() - t0, 3)
-    log.info("tagged %s (%.1fs audio, %d bytes) in %.2fs -> %s",
-             file.filename, result["duration_seconds"], size, result["processing_seconds"],
-             result["tags"][0]["label"] if result["tags"] else "-")
-    return JSONResponse(result)
+    size = os.path.getsize(tmp_path)
+    return JSONResponse(_tag_local_file(tmp_path, filename or os.path.basename(object_name), size,
+                                        top_k, threshold, segment_seconds, include_embedding, t0))
 
 
 @app.get("/", include_in_schema=False)

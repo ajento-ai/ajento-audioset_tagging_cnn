@@ -118,9 +118,23 @@ Form fields for `POST /api/tag`:
 | `segment_seconds`   | 0       | Also tag each fixed-length window (0 disables)       |
 | `include_embedding` | false   | Return the 2048-d clip embedding                     |
 
-Other endpoints: `GET /api/labels`, `GET /healthz`, `GET /docs` (OpenAPI UI).
-Uploads are capped at 32 MB (Cloud Run's request body limit for HTTP/1) and
-the first 600 s of audio (env `MAX_UPLOAD_MB`, `MAX_DURATION_SECONDS`).
+Large files: Cloud Run rejects request bodies over 32 MiB, so the browser UI
+uploads bigger files straight to a Cloud Storage bucket and then calls
+`POST /api/tag-object`. Programmatic flow: `POST /api/upload-session`
+(JSON `filename`, `content_type`, `size`) returns an `upload_url` to `PUT` the
+file to and an `object` name to pass to `/api/tag-object`. Objects are deleted
+after tagging and the bucket auto-expires anything left after one day. The
+Cloud Run runtime service account needs `roles/storage.objectAdmin` on the
+bucket (the deploy script prints a reminder).
+
+Recordings longer than 60 s are processed in 10 s windows and the overall tags
+are the mean over windows (`"aggregation": "mean_over_segments"`), which keeps
+memory flat for long files.
+
+Other endpoints: `GET /api/config`, `GET /api/labels`, `GET /healthz`, `GET /docs` (OpenAPI UI).
+Direct uploads are capped at 32 MB, bucket uploads at 1 GB, and analysis at
+the first 30 minutes of audio (env `MAX_UPLOAD_MB`, `UPLOAD_MAX_MB`,
+`MAX_DURATION_SECONDS`).
 
 ## Running locally
 

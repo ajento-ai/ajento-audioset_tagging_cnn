@@ -20,7 +20,11 @@ DOMAIN="${DOMAIN-audiotagging.ajento.app}"
 MIN_INSTANCES="${MIN_INSTANCES:-0}"
 MAX_INSTANCES="${MAX_INSTANCES:-5}"
 MEMORY="${MEMORY:-4Gi}"
-CPU="${CPU:-2}"
+CPU="${CPU:-4}"
+# Bucket for browser uploads larger than Cloud Run's 32 MiB request limit.
+# Set UPLOAD_BUCKET= (empty) to disable.
+UPLOAD_BUCKET="${UPLOAD_BUCKET-${PROJECT_ID}-${SERVICE}-uploads}"
+MAX_DURATION_SECONDS="${MAX_DURATION_SECONDS:-1800}"
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}"
 
 cd "$(dirname "$0")/.."
@@ -52,8 +56,26 @@ echo "==> Building image with Cloud Build (downloads the ~330 MB checkpoint; tak
 gcloud builds submit --config deploy/cloudbuild.yaml "${BUILD_SA_FLAG[@]}" \
   --substitutions="_REGION=${REGION},_REPO=${REPO},_IMAGE=${SERVICE},SHORT_SHA=$(git rev-parse --short HEAD 2>/dev/null || date +%s)" .
 
-ENV_VARS="MODEL_TYPE=Cnn14,MAX_UPLOAD_MB=32,MAX_DURATION_SECONDS=600,TORCH_NUM_THREADS=${CPU}"
+ENV_VARS="MODEL_TYPE=Cnn14,MAX_UPLOAD_MB=32,MAX_DURATION_SECONDS=${MAX_DURATION_SECONDS},TORCH_NUM_THREADS=${CPU}"
 if [[ -n "${API_KEY:-}" ]]; then ENV_VARS="${ENV_VARS},API_KEY=${API_KEY}"; fi
+
+if [[ -n "${UPLOAD_BUCKET}" ]]; then
+  echo "==> Ensuring upload bucket gs://${UPLOAD_BUCKET}"
+  if ! gcloud storage buckets describe "gs://${UPLOAD_BUCKET}" >/dev/null 2>&1; then
+    gcloud storage buckets create "gs://${UPLOAD_BUCKET}" --location="${REGION}" --uniform-bucket-level-access
+  fi
+  TMP_CFG="$(mktemp -d)"
+  ORIGINS="\"https://${SERVICE}-$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)').${REGION}.run.app\", \"http://localhost:8080\""
+  if [[ -n "${DOMAIN}" ]]; then ORIGINS="\"https://${DOMAIN}\", ${ORIGINS}"; fi
+  cat > "${TMP_CFG}/cors.json" <<EOF2
+[{"origin": [${ORIGINS}], "method": ["PUT", "POST", "OPTIONS"],
+  "responseHeader": ["Content-Type", "Content-Range", "x-goog-resumable", "Location", "Range"], "maxAgeSeconds": 3600}]
+EOF2
+  echo '{"rule": [{"action": {"type": "Delete"}, "condition": {"age": 1}}]}' > "${TMP_CFG}/lifecycle.json"
+  gcloud storage buckets update "gs://${UPLOAD_BUCKET}" --cors-file="${TMP_CFG}/cors.json" --lifecycle-file="${TMP_CFG}/lifecycle.json"
+  ENV_VARS="${ENV_VARS},UPLOAD_BUCKET=${UPLOAD_BUCKET}"
+  echo "   The Cloud Run runtime service account needs roles/storage.objectAdmin on this bucket."
+fi
 
 # --no-invoker-iam-check makes the service public without an allUsers IAM
 # binding, which organizations with domain-restricted sharing reject.
@@ -66,7 +88,7 @@ gcloud run deploy "${SERVICE}" \
   --port=8080 \
   --memory="${MEMORY}" --cpu="${CPU}" \
   --concurrency=2 \
-  --timeout=300 \
+  --timeout=900 \
   --min-instances="${MIN_INSTANCES}" --max-instances="${MAX_INSTANCES}" \
   --cpu-boost \
   --set-env-vars="${ENV_VARS}"

@@ -153,20 +153,33 @@ class AudioTagger:
         threshold: float = 0.0,
         segment_seconds: float = 0.0,
         include_embedding: bool = False,
+        whole_clip_max_seconds: float = 60.0,
     ) -> dict:
-        """Run clip-level tagging, optionally also per fixed-length segment."""
-        duration = waveform.shape[0] / self.sample_rate
-        clip_out = self._forward(waveform[None, :])
-        clip_probs = clip_out["clipwise_output"][0]
+        """Run clip-level tagging, optionally also per fixed-length segment.
 
+        Clips up to ``whole_clip_max_seconds`` are fed to the model in one
+        pass. Longer audio is processed in fixed windows (``segment_seconds``,
+        default 10 s) and the clip-level result is the mean of the window
+        probabilities, which keeps memory bounded for long recordings.
+        """
+        duration = waveform.shape[0] / self.sample_rate
         result = {
             "duration_seconds": round(duration, 3),
             "sample_rate": self.sample_rate,
             "model": self.model_type,
-            "tags": self._top_k(clip_probs, top_k, threshold),
         }
-        if include_embedding and "embedding" in clip_out:
-            result["embedding"] = clip_out["embedding"][0].round(5).tolist()
+
+        long_audio = duration > whole_clip_max_seconds
+        if long_audio and not segment_seconds:
+            segment_seconds = 10.0
+
+        if not long_audio:
+            clip_out = self._forward(waveform[None, :])
+            clip_probs = clip_out["clipwise_output"][0]
+            result["tags"] = self._top_k(clip_probs, top_k, threshold)
+            result["aggregation"] = "whole_clip"
+            if include_embedding and "embedding" in clip_out:
+                result["embedding"] = clip_out["embedding"][0].round(5).tolist()
 
         if segment_seconds and duration > segment_seconds:
             seg_len = int(segment_seconds * self.sample_rate)
@@ -175,9 +188,15 @@ class AudioTagger:
             padded[: waveform.shape[0]] = waveform
             batch = padded.reshape(n_segments, seg_len)
             segments = []
+            all_probs = []
+            embeddings = []
             batch_size = 8
             for start in range(0, n_segments, batch_size):
-                probs = self._forward(batch[start : start + batch_size])["clipwise_output"]
+                out = self._forward(batch[start : start + batch_size])
+                probs = out["clipwise_output"]
+                all_probs.append(probs)
+                if include_embedding and long_audio and "embedding" in out:
+                    embeddings.append(out["embedding"])
                 for i, p in enumerate(probs):
                     seg_idx = start + i
                     segments.append({
@@ -186,4 +205,10 @@ class AudioTagger:
                         "tags": self._top_k(p, top_k, threshold),
                     })
             result["segments"] = segments
+            if long_audio:
+                mean_probs = np.concatenate(all_probs, axis=0).mean(axis=0)
+                result["tags"] = self._top_k(mean_probs, top_k, threshold)
+                result["aggregation"] = "mean_over_segments"
+                if embeddings:
+                    result["embedding"] = np.concatenate(embeddings, 0).mean(0).round(5).tolist()
         return result
