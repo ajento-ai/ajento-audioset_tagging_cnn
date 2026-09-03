@@ -1,0 +1,51 @@
+# Deploys the audio tagging service to Cloud Run.
+#
+# One-time setup in GitHub repo settings:
+#   Secrets  -> GCP_SA_KEY      : JSON key of a service account with roles
+#                                 run.admin, cloudbuild.builds.editor,
+#                                 artifactregistry.admin, serviceusage.serviceUsageAdmin,
+#                                 iam.serviceAccountUser
+#   Variables-> GCP_PROJECT_ID  : your GCP project id
+#   Variables-> GCP_REGION      : optional, default us-central1
+#   Variables-> APP_DOMAIN      : optional, default audiotagging.ajento.app
+#   Secrets  -> APP_API_KEY     : optional, require X-API-Key on /api/*
+#
+# Then run this workflow manually (Actions -> Deploy to Cloud Run -> Run workflow)
+# or push to master.
+name: Deploy to Cloud Run
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - app/**
+      - pytorch/models.py
+      - pytorch/pytorch_utils.py
+      - metadata/class_labels_indices.csv
+      - Dockerfile
+      - deploy/**
+      - .github/workflows/deploy.yml
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION || 'us-central1' }}
+          DOMAIN: ${{ vars.APP_DOMAIN || 'audiotagging.ajento.app' }}
+          API_KEY: ${{ secrets.APP_API_KEY }}
+          MIN_INSTANCES: ${{ vars.MIN_INSTANCES || '0' }}
+        run: ./deploy/deploy.sh

@@ -41,6 +41,25 @@ Useful overrides: `REGION`, `SERVICE`, `DOMAIN` (set `DOMAIN=` to skip the
 mapping), `MIN_INSTANCES=1` (keeps one warm instance so the ~20 s model
 load never hits a user), `API_KEY=<secret>` (requires `X-API-Key` on `/api/*`).
 
+### Alternative: deploy from GitHub Actions
+
+`.github/workflows/deploy.yml` runs the same script from CI. Create a service
+account, grant it `roles/run.admin`, `roles/cloudbuild.builds.editor`,
+`roles/artifactregistry.admin`, `roles/serviceusage.serviceUsageAdmin` and
+`roles/iam.serviceAccountUser`, download a JSON key, and add it as the repo
+secret `GCP_SA_KEY` plus the repo variable `GCP_PROJECT_ID`. Then trigger the
+workflow from the Actions tab (or push to `master`).
+
+```bash
+PROJECT_ID=<your-gcp-project>
+SA=deployer@${PROJECT_ID}.iam.gserviceaccount.com
+gcloud iam service-accounts create deployer --project $PROJECT_ID
+for r in run.admin cloudbuild.builds.editor artifactregistry.admin serviceusage.serviceUsageAdmin iam.serviceAccountUser storage.admin; do
+  gcloud projects add-iam-policy-binding $PROJECT_ID --member serviceAccount:$SA --role roles/$r
+done
+gcloud iam service-accounts keys create key.json --iam-account $SA
+```
+
 ## 2. Point the domain
 
 Cloud Run domain mappings need the parent domain verified once for your Google
