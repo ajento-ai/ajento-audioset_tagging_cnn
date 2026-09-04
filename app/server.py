@@ -44,9 +44,15 @@ class Settings:
     whisper_beam_size = _env_int("WHISPER_BEAM_SIZE", 1)
     # Speaker labels for the breakdown table. Set DIARIZATION="0" to disable.
     diarization_enabled = os.environ.get("DIARIZATION", "1") not in ("0", "false", "")
-    # Interpretation column (inference, via the Claude API). Disabled without a key.
-    anthropic_api_key: Optional[str] = os.environ.get("ANTHROPIC_API_KEY") or None
-    interpretation_model = os.environ.get("INTERPRETATION_MODEL", "claude-opus-5")
+    # Interpretation column (inference, via Gemini). Uses Vertex AI with the
+    # runtime service account by default; GEMINI_API_KEY switches to the API.
+    # Set INTERPRETATION=0 to turn the column off entirely.
+    interpretation_enabled = os.environ.get("INTERPRETATION", "1") not in ("0", "false", "")
+    gemini_api_key: Optional[str] = os.environ.get("GEMINI_API_KEY") or None
+    gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_project: Optional[str] = (os.environ.get("GEMINI_PROJECT")
+                                     or os.environ.get("GOOGLE_CLOUD_PROJECT") or None)
+    gemini_location = os.environ.get("GEMINI_LOCATION", "us-central1")
     sample_rate = _env_int("SAMPLE_RATE", 32000)
     window_size = _env_int("WINDOW_SIZE", 1024)
     hop_size = _env_int("HOP_SIZE", 320)
@@ -123,17 +129,17 @@ def _load_model() -> None:
             log.exception("Could not load diarizer; speaker labels disabled")
             diarizer = None
 
-    if settings.anthropic_api_key:
+    if settings.interpretation_enabled:
         try:
             from .interpreter import Interpreter
 
-            interpreter = Interpreter(api_key=settings.anthropic_api_key,
-                                      model=settings.interpretation_model)
+            interpreter = Interpreter(api_key=settings.gemini_api_key,
+                                      model=settings.gemini_model,
+                                      project=settings.gemini_project,
+                                      location=settings.gemini_location)
         except Exception:
             log.exception("Could not init interpreter; interpretation column disabled")
             interpreter = None
-    else:
-        log.info("ANTHROPIC_API_KEY not set; interpretation column disabled")
 
     log.info("Loaded %s (+SED=%s, +Whisper=%s, +Diarizer=%s, +Interpreter=%s) on %s in %.1fs",
              settings.model_type, bool(tagger.sed_model), bool(transcriber), bool(diarizer),
