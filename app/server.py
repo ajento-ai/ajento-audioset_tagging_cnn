@@ -198,7 +198,9 @@ def _tag_local_file(tmp_path: str, filename: str, size: int, top_k: int, thresho
             else:
                 result.update(events_out)
         if transcript_table:
-            rows = tagger.build_transcript_table(waveform, transcriber, threshold=max(threshold, 0.15))
+            step("transcribing", 0.5)
+            rows = tagger.build_transcript_table(waveform, transcriber,
+                                                 threshold=max(threshold, 0.15), cache=cache)
             if rows is None:
                 result["transcript_unavailable"] = (
                     "Transcript table is not available: the server needs both the "

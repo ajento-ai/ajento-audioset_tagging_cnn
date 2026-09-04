@@ -359,6 +359,7 @@ class AudioTagger:
         min_turn_seconds: float = 0.4,
         other_top_k: int = 2,
         max_rows: int = 400,
+        cache: Optional[dict] = None,
     ) -> Optional[List[dict]]:
         """One row per continuous stretch of speech: when it ran, what was
         said, and what else (music, other sounds) was audible during it.
