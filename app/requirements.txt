@@ -8,3 +8,4 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 python-multipart>=0.0.9
 google-cloud-storage>=2.14
+faster-whisper>=1.0

@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .tagger import AudioTagger
+from .transcriber import SpeechTranscriber
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("audiotagging")
@@ -37,6 +38,10 @@ class Settings:
     sed_model_type = os.environ.get("SED_MODEL_TYPE", "Cnn14_DecisionLevelMax")
     sed_checkpoint_path = os.environ.get(
         "SED_CHECKPOINT_PATH", "/models/Cnn14_DecisionLevelMax_mAP=0.385.pth")
+    # Speech-to-text for the transcript table. Set WHISPER_MODEL_SIZE="" to disable.
+    whisper_model_size = os.environ.get("WHISPER_MODEL_SIZE", "base")
+    whisper_model_dir = os.environ.get("WHISPER_MODEL_DIR", "/models/whisper")
+    whisper_beam_size = _env_int("WHISPER_BEAM_SIZE", 1)
     sample_rate = _env_int("SAMPLE_RATE", 32000)
     window_size = _env_int("WINDOW_SIZE", 1024)
     hop_size = _env_int("HOP_SIZE", 320)
@@ -62,11 +67,12 @@ app = FastAPI(title="Ajento Audio Tagging", version="1.0.0",
               description="AudioSet tagging with PANNs (Cnn14). Upload audio, get labels.")
 
 tagger: Optional[AudioTagger] = None
+transcriber: Optional[SpeechTranscriber] = None
 
 
 @app.on_event("startup")
 def _load_model() -> None:
-    global tagger
+    global tagger, transcriber
     t0 = time.time()
     ckpt = settings.checkpoint_path if os.path.exists(settings.checkpoint_path) else None
     if ckpt is None:
@@ -89,8 +95,19 @@ def _load_model() -> None:
         sed_model_type=settings.sed_model_type,
         sed_checkpoint_path=sed_ckpt,
     )
-    log.info("Loaded %s (+SED=%s) on %s in %.1fs", settings.model_type,
-             bool(tagger.sed_model), tagger.device, time.time() - t0)
+    if settings.whisper_model_size:
+        try:
+            transcriber = SpeechTranscriber(
+                model_size=settings.whisper_model_size,
+                download_root=settings.whisper_model_dir or None,
+                beam_size=settings.whisper_beam_size,
+            )
+        except Exception:
+            log.exception("Could not load Whisper model; transcript table disabled")
+            transcriber = None
+
+    log.info("Loaded %s (+SED=%s, +Whisper=%s) on %s in %.1fs", settings.model_type,
+             bool(tagger.sed_model), bool(transcriber), tagger.device, time.time() - t0)
 
 
 def require_api_key(
@@ -114,7 +131,7 @@ def labels():
 
 def _tag_local_file(tmp_path: str, filename: str, size: int, top_k: int, threshold: float,
                     segment_seconds: float, include_embedding: bool, timeline_seconds: float,
-                    t0: float) -> dict:
+                    transcript_table: bool, t0: float) -> dict:
     try:
         try:
             waveform = tagger.decode_audio(tmp_path, max_seconds=settings.max_duration_seconds)
@@ -132,6 +149,15 @@ def _tag_local_file(tmp_path: str, filename: str, size: int, top_k: int, thresho
                 )
             else:
                 result.update(events_out)
+        if transcript_table:
+            rows = tagger.build_transcript_table(waveform, transcriber, threshold=max(threshold, 0.15))
+            if rows is None:
+                result["transcript_unavailable"] = (
+                    "Transcript table is not available: the server needs both the "
+                    "sound event detection model and the speech-to-text model."
+                )
+            else:
+                result["transcript_table"] = rows
     finally:
         try:
             os.remove(tmp_path)
@@ -159,6 +185,8 @@ def config():
         "max_duration_seconds": settings.max_duration_seconds,
         "default_top_k": settings.default_top_k,
         "timeline_available": tagger is not None and tagger.sed_model is not None,
+        "transcript_available": (tagger is not None and tagger.sed_model is not None
+                                 and transcriber is not None),
     }
 
 
@@ -172,6 +200,8 @@ async def tag_audio(
     include_embedding: bool = Form(default=False),
     timeline_seconds: float = Form(default=0.0, ge=0.0, le=10.0,
                                    description="Also return a timestamped timeline/events at this bin size in seconds (0 = off)"),
+    transcript_table: bool = Form(default=False,
+                                  description="Also return one row per speech turn with its transcript (slower)"),
 ):
     if tagger is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
@@ -198,7 +228,8 @@ async def tag_audio(
         os.remove(tmp_path)
         raise HTTPException(status_code=400, detail="Empty upload")
     return JSONResponse(_tag_local_file(tmp_path, file.filename, size, top_k, threshold,
-                                        segment_seconds, include_embedding, timeline_seconds, t0))
+                                        segment_seconds, include_embedding, timeline_seconds,
+                                        transcript_table, t0))
 
 
 # ---------------------------------------------------------------- large files
@@ -243,6 +274,7 @@ def tag_object(
     segment_seconds: float = Form(default=0.0, ge=0.0, le=60.0),
     include_embedding: bool = Form(default=False),
     timeline_seconds: float = Form(default=0.0, ge=0.0, le=10.0),
+    transcript_table: bool = Form(default=False),
 ):
     """Tag a file previously uploaded via /api/upload-session, then delete it."""
     if tagger is None:
@@ -269,7 +301,7 @@ def tag_object(
     size = os.path.getsize(tmp_path)
     return JSONResponse(_tag_local_file(tmp_path, filename or os.path.basename(object_name), size,
                                         top_k, threshold, segment_seconds, include_embedding,
-                                        timeline_seconds, t0))
+                                        timeline_seconds, transcript_table, t0))
 
 
 @app.get("/", include_in_schema=False)

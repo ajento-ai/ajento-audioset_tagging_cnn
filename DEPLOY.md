@@ -153,6 +153,28 @@ that time. Set `SED_MODEL_URL=""` at build time to skip downloading this
 second checkpoint if you don't need the feature; `GET /api/config` reports
 `timeline_available` so the UI can hide the option automatically.
 
+### Transcript table
+
+Pass `transcript_table=true` to `/api/tag` or `/api/tag-object` to also get
+`transcript_table`: one row per continuous stretch of speech, with
+
+- `start` / `end`: when that speech turn ran,
+- `speech`: what was said, transcribed by Whisper (`base` by default),
+- `music`: the strongest music-related label during the turn, if any,
+- `other_sounds`: other salient non-speech labels during the turn.
+
+Speech turns come from the frame-level model, so Whisper only ever runs on the
+stretches that actually contain speech rather than the whole file. Only speech
+has words to transcribe — the music and other-sound columns carry labels and
+confidences, not text.
+
+Configure with `WHISPER_MODEL_SIZE` (default `base`, set to `""` to disable
+speech-to-text entirely), `WHISPER_MODEL_DIR`, and `WHISPER_BEAM_SIZE`
+(default 1, greedy; raise for slightly better and slower transcripts). The
+weights are baked into the image at build time. If the model cannot be loaded
+the rest of the service still works and `GET /api/config` reports
+`transcript_available: false`, which hides the option in the UI.
+
 Other endpoints: `GET /api/config`, `GET /api/labels`, `GET /healthz`, `GET /docs` (OpenAPI UI).
 Direct uploads are capped at 32 MB, bucket uploads at 1 GB, and analysis at
 the first 30 minutes of audio (env `MAX_UPLOAD_MB`, `UPLOAD_MAX_MB`,

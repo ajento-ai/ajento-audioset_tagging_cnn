@@ -171,6 +171,32 @@ class AudioTagger:
         out = self.sed_model(x, None)
         return out["framewise_output"].cpu().numpy()
 
+    def _label_group_indices(self, substrings, exact=frozenset()) -> List[int]:
+        subs = [x.lower() for x in substrings]
+        return [i for i, label in enumerate(self.labels)
+                if any(x in label.lower() for x in subs) or label in exact]
+
+    @staticmethod
+    def _merge_runs(mask: np.ndarray, frames_per_second: float, merge_gap_seconds: float,
+                    min_run_seconds: float) -> List[tuple]:
+        """Contiguous (start_frame, end_frame) runs of True, merged across short gaps."""
+        hits = np.flatnonzero(mask)
+        if hits.size == 0:
+            return []
+        gap_frames = max(1, int(round(merge_gap_seconds * frames_per_second)))
+        runs = []
+        run_start = prev = int(hits[0])
+        for i in hits[1:]:
+            i = int(i)
+            if i - prev <= gap_frames:
+                prev = i
+            else:
+                runs.append((run_start, prev))
+                run_start = prev = i
+        runs.append((run_start, prev))
+        min_frames = min_run_seconds * frames_per_second
+        return [(a, b) for a, b in runs if (b - a + 1) >= min_frames]
+
     def detect_events(
         self,
         waveform: np.ndarray,
@@ -212,31 +238,13 @@ class AudioTagger:
                 "tags": self._top_k(window_probs, top_k, threshold),
             })
 
-        gap_frames = max(1, int(round(merge_gap_seconds * frames_per_second)))
         above = framewise >= threshold
         events = []
         for class_idx in range(framewise.shape[1]):
-            hits = np.flatnonzero(above[:, class_idx])
-            if hits.size == 0:
-                continue
-            run_start = prev = int(hits[0])
-            runs = []
-            for i in hits[1:]:
-                i = int(i)
-                if i - prev <= gap_frames:
-                    prev = i
-                else:
-                    runs.append((run_start, prev))
-                    run_start = prev = i
-            runs.append((run_start, prev))
-            for start_f, end_f in runs:
-                if (end_f - start_f + 1) / frames_per_second < min_event_seconds:
-                    continue
+            for start_f, end_f in self._merge_runs(above[:, class_idx], frames_per_second,
+                                                   merge_gap_seconds, min_event_seconds):
                 segment = framewise[start_f : end_f + 1, class_idx]
                 peak_f = start_f + int(np.argmax(segment))
-                # start_f/end_f/peak_f are now plain Python ints, so every
-                # derived value below is a plain float, not numpy.float64
-                # (which json.dumps cannot serialize).
                 events.append({
                     "label": self.labels[class_idx],
                     "index": class_idx,
@@ -322,3 +330,66 @@ class AudioTagger:
                 if embeddings:
                     result["embedding"] = np.concatenate(embeddings, 0).mean(0).round(5).tolist()
         return result
+
+    def build_transcript_table(
+        self,
+        waveform: np.ndarray,
+        transcriber,
+        threshold: float = 0.15,
+        merge_gap_seconds: float = 0.6,
+        min_turn_seconds: float = 0.4,
+        other_top_k: int = 2,
+        max_rows: int = 400,
+    ) -> Optional[List[dict]]:
+        """One row per continuous stretch of speech: when it ran, what was
+        said, and what else (music, other sounds) was audible during it.
+
+        Speech stretches come from the frame-level model; the text comes from
+        the transcriber, which only ever sees those stretches, not the whole
+        file. Non-speech columns carry labels and confidences, since only
+        speech has words to transcribe.
+        """
+        if self.sed_model is None or transcriber is None:
+            return None
+
+        duration = waveform.shape[0] / self.sample_rate
+        framewise = self._forward_framewise(waveform[None, :])[0]
+        frames_per_second = self.sample_rate / self.hop_size
+
+        speech_idx = self._label_group_indices(
+            ["speech"], exact={"Conversation", "Narration, monologue", "Babbling", "Whispering"})
+        music_idx = self._label_group_indices(["music", "singing"])
+        if not speech_idx:
+            return []
+
+        speech_mask = framewise[:, speech_idx].max(axis=1) >= threshold
+        runs = self._merge_runs(speech_mask, frames_per_second, merge_gap_seconds, min_turn_seconds)[:max_rows]
+
+        excluded = set(speech_idx) | set(music_idx)
+        rows = []
+        for start_f, end_f in runs:
+            start_t = start_f / frames_per_second
+            end_t = min((end_f + 1) / frames_per_second, duration)
+            clip = waveform[int(start_t * self.sample_rate) : int(end_t * self.sample_rate)]
+            window = framewise[start_f : end_f + 1]
+
+            music = None
+            if music_idx:
+                music_peaks = window[:, music_idx].max(axis=0)
+                best = int(np.argmax(music_peaks))
+                if float(music_peaks[best]) >= threshold:
+                    music = {"label": self.labels[music_idx[best]],
+                             "probability": round(float(music_peaks[best]), 3)}
+
+            other_probs = window.max(axis=0).copy()
+            other_probs[list(excluded)] = 0.0
+
+            rows.append({
+                "start": round(start_t, 2),
+                "end": round(end_t, 2),
+                "speech": transcriber.transcribe(clip, self.sample_rate),
+                "speech_confidence": round(float(window[:, speech_idx].max()), 3),
+                "music": music,
+                "other_sounds": self._top_k(other_probs, other_top_k, threshold),
+            })
+        return rows

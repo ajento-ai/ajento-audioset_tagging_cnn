@@ -41,6 +41,12 @@
   .eventrow { display: flex; gap: 10px; padding: 3px 0; font-size: 13px; border-bottom: 1px solid #1c1f27; }
   .eventrow .t { color: var(--accent); width: 130px; flex: none; font-variant-numeric: tabular-nums; }
   .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .tablewrap { overflow-x: auto; margin-top: 8px; max-height: 420px; overflow-y: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #22262f; vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--card); }
+  td.time { white-space: nowrap; color: var(--accent); font-variant-numeric: tabular-nums; }
+  td.quiet { color: var(--muted); }
 </style>
 </head>
 <body>
@@ -64,6 +70,11 @@
       <input type="checkbox" id="timeline" checked>
       <label for="timeline" style="margin:0">Timestamped timeline (when things happen, second by second)</label>
     </div>
+    <div class="toggle">
+      <input type="checkbox" id="transcript">
+      <label for="transcript" style="margin:0">Transcript table (speech turns with what was said)</label>
+    </div>
+    <div class="help" id="transcriptHelp">One row per stretch of speech: when it ran, the transcribed words, and what else was audible (music, other sounds). Adds noticeably to processing time.</div>
     <div class="help" id="timelineHelp">Uses a frame-level model (~10ms resolution) to say when a sound starts and stops, e.g. music from 12s–90s or an impact at 45.3s. It only names generic sound classes (Music, Speech, Slam, Thud, ...), not what caused them.</div>
   </div>
 
@@ -71,6 +82,7 @@
     <div class="meta" id="meta"></div>
     <div id="tags"></div>
     <details class="seg" id="segments" hidden><summary>Per-segment tags</summary><div id="segbody"></div></details>
+    <details class="seg" id="transcriptBlock" hidden open><summary>Transcript table</summary><div class="tablewrap"><table id="transcriptTable"></table></div><div class="note" id="transcriptEmpty" hidden>No speech was detected in this file.</div></details>
     <details class="seg" id="events" hidden open><summary>Notable events (timestamped)</summary><div class="scroll" id="eventbody"></div><div class="note" id="eventsEmpty" hidden>No events crossed the detection threshold.</div></details>
     <details class="seg" id="timelineBlock" hidden><summary>Per-second timeline</summary><div class="scroll" id="timelinebody"></div></details>
     <details class="seg"><summary>Raw JSON</summary><pre id="json"></pre></details>
@@ -86,6 +98,11 @@
       $('timeline').checked = false; $('timeline').disabled = true;
       document.querySelector('label[for=timeline]').parentElement.hidden = true;
       $('timelineHelp').hidden = true;
+    }
+    if (!c.transcript_available) {
+      $('transcript').checked = false; $('transcript').disabled = true;
+      document.querySelector('label[for=transcript]').parentElement.hidden = true;
+      $('transcriptHelp').hidden = true;
     }
   }).catch(() => {});
   let selected = null;
@@ -119,6 +136,24 @@
       xhr.send(file);
     });
   }
+  function esc(v) { const d = document.createElement('div'); d.textContent = v == null ? '' : String(v); return d.innerHTML; }
+  function fmtTime(sec) {
+    const m = Math.floor(sec / 60), s = (sec % 60).toFixed(1).padStart(4, '0');
+    return `${m}:${s}`;
+  }
+  function renderTranscript(rows) {
+    $('transcriptBlock').hidden = false;
+    $('transcriptEmpty').hidden = rows.length > 0;
+    const head = '<tr><th>Time</th><th>Speech (transcript)</th><th>Music</th><th>Other sounds</th></tr>';
+    $('transcriptTable').innerHTML = head + rows.map(r => {
+      const music = r.music ? `${esc(r.music.label)} (${r.music.probability.toFixed(2)})` : '<span class="quiet">—</span>';
+      const other = r.other_sounds && r.other_sounds.length
+        ? r.other_sounds.map(t => `${esc(t.label)} (${t.probability.toFixed(2)})`).join(', ')
+        : '<span class="quiet">—</span>';
+      const text = r.speech ? esc(r.speech) : '<span class="quiet">(no words recognised)</span>';
+      return `<tr><td class="time">${fmtTime(r.start)} – ${fmtTime(r.end)}</td><td>${text}</td><td>${music}</td><td>${other}</td></tr>`;
+    }).join('');
+  }
   async function parseResponse(r) {
     const text = await r.text();
     try { return JSON.parse(text); }
@@ -128,7 +163,8 @@
     if (!selected) return;
     const btn = $('go'); btn.disabled = true; btn.textContent = 'Analyzing…';
     const params = { top_k: $('topk').value, threshold: $('thr').value, segment_seconds: $('seg').value,
-      timeline_seconds: $('timeline').checked ? 1 : 0 };
+      timeline_seconds: $('timeline').checked ? 1 : 0,
+      transcript_table: $('transcript').checked };
     try {
       let r;
       if (cfg.bucket_upload && selected.size > cfg.direct_upload_max_mb * 1048576) {
@@ -158,6 +194,9 @@
         $('segments').hidden = false;
         $('segbody').innerHTML = data.segments.map(s => `<div class="segrow"><span class="t">${s.start}s – ${s.end}s</span><span>${s.tags.slice(0,3).map(t => `${t.label} (${t.probability.toFixed(2)})`).join(', ')}</span></div>`).join('');
       } else $('segments').hidden = true;
+      if (data.transcript_table) renderTranscript(data.transcript_table);
+      else $('transcriptBlock').hidden = true;
+      if (data.transcript_unavailable) $('meta').innerHTML += ` <span class="err">${esc(data.transcript_unavailable)}</span>`;
       if (data.events) {
         $('events').hidden = false;
         $('eventsEmpty').hidden = data.events.length > 0;
