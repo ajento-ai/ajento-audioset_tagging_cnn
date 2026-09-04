@@ -16,7 +16,9 @@ from typing import List, Optional
 
 log = logging.getLogger("audiotagging.interpreter")
 
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# Verified against the project: the 3.x flash models resolve only in the
+# "global" location, not regional endpoints such as us-central1.
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
 SYSTEM = """You annotate an audio breakdown for a film/production team.
 
@@ -60,7 +62,7 @@ class Interpreter:
     """One structured-output call over the whole table."""
 
     def __init__(self, api_key: Optional[str] = None, model: str = DEFAULT_MODEL,
-                 project: Optional[str] = None, location: str = "us-central1",
+                 project: Optional[str] = None, location: str = "global",
                  max_rows: int = 300):
         from google import genai
 

@@ -49,10 +49,10 @@ class Settings:
     # Set INTERPRETATION=0 to turn the column off entirely.
     interpretation_enabled = os.environ.get("INTERPRETATION", "1") not in ("0", "false", "")
     gemini_api_key: Optional[str] = os.environ.get("GEMINI_API_KEY") or None
-    gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
     gemini_project: Optional[str] = (os.environ.get("GEMINI_PROJECT")
                                      or os.environ.get("GOOGLE_CLOUD_PROJECT") or None)
-    gemini_location = os.environ.get("GEMINI_LOCATION", "us-central1")
+    gemini_location = os.environ.get("GEMINI_LOCATION", "global")
     sample_rate = _env_int("SAMPLE_RATE", 32000)
     window_size = _env_int("WINDOW_SIZE", 1024)
     hop_size = _env_int("HOP_SIZE", 320)

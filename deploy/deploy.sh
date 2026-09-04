@@ -57,6 +57,10 @@ gcloud builds submit --config deploy/cloudbuild.yaml "${BUILD_SA_FLAG[@]}" \
   --substitutions="_REGION=${REGION},_REPO=${REPO},_IMAGE=${SERVICE},SHORT_SHA=$(git rev-parse --short HEAD 2>/dev/null || date +%s)" .
 
 ENV_VARS="MODEL_TYPE=Cnn14,MAX_UPLOAD_MB=32,MAX_DURATION_SECONDS=${MAX_DURATION_SECONDS},TORCH_NUM_THREADS=${CPU}"
+# Interpretation column via Gemini on Vertex AI, using the runtime service
+# account (needs roles/aiplatform.user). The 3.x flash models resolve only in
+# the "global" location.
+ENV_VARS="${ENV_VARS},GEMINI_PROJECT=${PROJECT_ID},GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.8-flash},GEMINI_LOCATION=${GEMINI_LOCATION:-global}"
 if [[ -n "${API_KEY:-}" ]]; then ENV_VARS="${ENV_VARS},API_KEY=${API_KEY}"; fi
 
 if [[ -n "${UPLOAD_BUCKET}" ]]; then
