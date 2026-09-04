@@ -42,6 +42,11 @@ class Settings:
     whisper_model_size = os.environ.get("WHISPER_MODEL_SIZE", "base")
     whisper_model_dir = os.environ.get("WHISPER_MODEL_DIR", "/models/whisper")
     whisper_beam_size = _env_int("WHISPER_BEAM_SIZE", 1)
+    # Speaker labels for the breakdown table. Set DIARIZATION="0" to disable.
+    diarization_enabled = os.environ.get("DIARIZATION", "1") not in ("0", "false", "")
+    # Interpretation column (inference, via the Claude API). Disabled without a key.
+    anthropic_api_key: Optional[str] = os.environ.get("ANTHROPIC_API_KEY") or None
+    interpretation_model = os.environ.get("INTERPRETATION_MODEL", "claude-opus-5")
     sample_rate = _env_int("SAMPLE_RATE", 32000)
     window_size = _env_int("WINDOW_SIZE", 1024)
     hop_size = _env_int("HOP_SIZE", 320)
@@ -68,11 +73,13 @@ app = FastAPI(title="Ajento Audio Tagging", version="1.0.0",
 
 tagger: Optional[AudioTagger] = None
 transcriber: Optional[SpeechTranscriber] = None
+diarizer = None
+interpreter = None
 
 
 @app.on_event("startup")
 def _load_model() -> None:
-    global tagger, transcriber
+    global tagger, transcriber, diarizer, interpreter
     t0 = time.time()
     ckpt = settings.checkpoint_path if os.path.exists(settings.checkpoint_path) else None
     if ckpt is None:
@@ -106,8 +113,31 @@ def _load_model() -> None:
             log.exception("Could not load Whisper model; transcript table disabled")
             transcriber = None
 
-    log.info("Loaded %s (+SED=%s, +Whisper=%s) on %s in %.1fs", settings.model_type,
-             bool(tagger.sed_model), bool(transcriber), tagger.device, time.time() - t0)
+    if settings.diarization_enabled:
+        try:
+            from .diarizer import SpeakerDiarizer
+
+            diarizer = SpeakerDiarizer(
+                distance_threshold=float(os.environ.get("DIARIZATION_THRESHOLD", "0.35")))
+        except Exception:
+            log.exception("Could not load diarizer; speaker labels disabled")
+            diarizer = None
+
+    if settings.anthropic_api_key:
+        try:
+            from .interpreter import Interpreter
+
+            interpreter = Interpreter(api_key=settings.anthropic_api_key,
+                                      model=settings.interpretation_model)
+        except Exception:
+            log.exception("Could not init interpreter; interpretation column disabled")
+            interpreter = None
+    else:
+        log.info("ANTHROPIC_API_KEY not set; interpretation column disabled")
+
+    log.info("Loaded %s (+SED=%s, +Whisper=%s, +Diarizer=%s, +Interpreter=%s) on %s in %.1fs",
+             settings.model_type, bool(tagger.sed_model), bool(transcriber), bool(diarizer),
+             bool(interpreter), tagger.device, time.time() - t0)
 
 
 def require_api_key(
@@ -131,7 +161,7 @@ def labels():
 
 def _tag_local_file(tmp_path: str, filename: str, size: int, top_k: int, threshold: float,
                     segment_seconds: float, include_embedding: bool, timeline_seconds: float,
-                    transcript_table: bool, t0: float) -> dict:
+                    transcript_table: bool, breakdown: bool, t0: float) -> dict:
     try:
         try:
             waveform = tagger.decode_audio(tmp_path, max_seconds=settings.max_duration_seconds)
@@ -158,6 +188,23 @@ def _tag_local_file(tmp_path: str, filename: str, size: int, top_k: int, thresho
                 )
             else:
                 result["transcript_table"] = rows
+        if breakdown:
+            rows = tagger.build_breakdown_table(waveform, transcriber=transcriber,
+                                                diarizer=diarizer)
+            if rows is None:
+                result["breakdown_unavailable"] = (
+                    "Breakdown table needs the sound event detection model, which is not loaded."
+                )
+            else:
+                if interpreter is not None and rows:
+                    for row, text in zip(rows, interpreter.annotate(rows)):
+                        row["interpretation"] = text
+                result["breakdown_table"] = rows
+                result["breakdown_columns"] = {
+                    "detected": ["start", "end", "dialogue", "audio", "entity", "confidence"],
+                    "inferred": ["interpretation"] if interpreter is not None else [],
+                    "empty_for_video_or_script": ["action", "performance", "camera"],
+                }
     finally:
         try:
             os.remove(tmp_path)
@@ -187,6 +234,9 @@ def config():
         "timeline_available": tagger is not None and tagger.sed_model is not None,
         "transcript_available": (tagger is not None and tagger.sed_model is not None
                                  and transcriber is not None),
+        "breakdown_available": tagger is not None and tagger.sed_model is not None,
+        "diarization_available": diarizer is not None,
+        "interpretation_available": interpreter is not None,
     }
 
 
@@ -202,6 +252,8 @@ async def tag_audio(
                                    description="Also return a timestamped timeline/events at this bin size in seconds (0 = off)"),
     transcript_table: bool = Form(default=False,
                                   description="Also return one row per speech turn with its transcript (slower)"),
+    breakdown: bool = Form(default=False,
+                           description="Also return the production breakdown table (speech turns + events)"),
 ):
     if tagger is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
@@ -229,7 +281,7 @@ async def tag_audio(
         raise HTTPException(status_code=400, detail="Empty upload")
     return JSONResponse(_tag_local_file(tmp_path, file.filename, size, top_k, threshold,
                                         segment_seconds, include_embedding, timeline_seconds,
-                                        transcript_table, t0))
+                                        transcript_table, breakdown, t0))
 
 
 # ---------------------------------------------------------------- large files
@@ -275,6 +327,7 @@ def tag_object(
     include_embedding: bool = Form(default=False),
     timeline_seconds: float = Form(default=0.0, ge=0.0, le=10.0),
     transcript_table: bool = Form(default=False),
+    breakdown: bool = Form(default=False),
 ):
     """Tag a file previously uploaded via /api/upload-session, then delete it."""
     if tagger is None:
@@ -301,7 +354,7 @@ def tag_object(
     size = os.path.getsize(tmp_path)
     return JSONResponse(_tag_local_file(tmp_path, filename or os.path.basename(object_name), size,
                                         top_k, threshold, segment_seconds, include_embedding,
-                                        timeline_seconds, transcript_table, t0))
+                                        timeline_seconds, transcript_table, breakdown, t0))
 
 
 @app.get("/", include_in_schema=False)

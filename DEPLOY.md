@@ -175,6 +175,38 @@ weights are baked into the image at build time. If the model cannot be loaded
 the rest of the service still works and `GET /api/config` reports
 `transcript_available: false`, which hides the option in the UI.
 
+### Breakdown table
+
+Pass `breakdown=true` to `/api/tag` or `/api/tag-object` for a production-style
+table in `breakdown_table`: one row per speech turn **and** per notable sound
+event, sorted by time. Each row has `kind` (`speech` or `event`), `start`/`end`,
+`dialogue`, `audio`, `entity`, `confidence`, `interpretation`, and empty
+`action` / `performance` / `camera`.
+
+`breakdown_columns` says which columns are which, and the UI labels them the
+same way:
+
+- **detected** - measured from the audio (dialogue, audio label, entity, confidence).
+- **inferred** - `interpretation`, written by Claude (`claude-opus-5`) from the
+  detected rows. Present only when `ANTHROPIC_API_KEY` is set.
+- **empty_for_video_or_script** - `action`, `performance`, `camera`. Nothing in
+  the audio carries these; they are left blank for a human or a video stage.
+
+`entity` is a speaker label (`Speaker 1`, ...) on speech rows when diarization
+is available, and a conservative source guess on event rows (Knock -> Door).
+Disable speaker labels with `DIARIZATION=0`; tune with `DIARIZATION_THRESHOLD`
+(default 0.35 cosine distance - higher merges speakers, lower splits one
+speaker across turns).
+
+To enable the interpretation column on Cloud Run, store the key in Secret
+Manager and reference it:
+
+```bash
+echo -n "$ANTHROPIC_API_KEY" | gcloud secrets create anthropic-api-key --data-file=- --project PROJECT_ID
+gcloud run services update audiotagging --region us-central1 --project PROJECT_ID \
+  --set-secrets ANTHROPIC_API_KEY=anthropic-api-key:latest
+```
+
 Other endpoints: `GET /api/config`, `GET /api/labels`, `GET /healthz`, `GET /docs` (OpenAPI UI).
 Direct uploads are capped at 32 MB, bucket uploads at 1 GB, and analysis at
 the first 30 minutes of audio (env `MAX_UPLOAD_MB`, `UPLOAD_MAX_MB`,

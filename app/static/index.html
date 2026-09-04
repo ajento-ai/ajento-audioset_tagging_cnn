@@ -47,6 +47,10 @@
   th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--card); }
   td.time { white-space: nowrap; color: var(--accent); font-variant-numeric: tabular-nums; }
   td.quiet { color: var(--muted); }
+  .inferred { color: #c3a6ff; }
+  .legend { color: var(--muted); font-size: 12px; margin: 8px 0; }
+  .dl { background: transparent; border: 1px solid #3a4050; color: var(--fg); padding: 6px 12px; font-size: 13px; border-radius: 6px; margin-top: 10px; }
+  .kind { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -71,6 +75,11 @@
       <label for="timeline" style="margin:0">Timestamped timeline (when things happen, second by second)</label>
     </div>
     <div class="toggle">
+      <input type="checkbox" id="breakdown">
+      <label for="breakdown" style="margin:0">Breakdown table (speech turns + events, with interpretation)</label>
+    </div>
+    <div class="help" id="breakdownHelp">Production-style table: one row per speech turn and per notable sound event, in time order, with transcript, speaker, entity and an interpretation column.</div>
+    <div class="toggle">
       <input type="checkbox" id="transcript">
       <label for="transcript" style="margin:0">Transcript table (speech turns with what was said)</label>
     </div>
@@ -82,6 +91,7 @@
     <div class="meta" id="meta"></div>
     <div id="tags"></div>
     <details class="seg" id="segments" hidden><summary>Per-segment tags</summary><div id="segbody"></div></details>
+    <details class="seg" id="breakdownBlock" hidden open><summary>Breakdown table</summary><div class="legend" id="breakdownLegend"></div><div class="tablewrap"><table id="breakdownTable"></table></div><button class="dl" id="breakdownCsv">Download CSV</button><div class="note" id="breakdownEmpty" hidden>Nothing detected above the threshold.</div></details>
     <details class="seg" id="transcriptBlock" hidden open><summary>Transcript table</summary><div class="tablewrap"><table id="transcriptTable"></table></div><div class="note" id="transcriptEmpty" hidden>No speech was detected in this file.</div></details>
     <details class="seg" id="events" hidden open><summary>Notable events (timestamped)</summary><div class="scroll" id="eventbody"></div><div class="note" id="eventsEmpty" hidden>No events crossed the detection threshold.</div></details>
     <details class="seg" id="timelineBlock" hidden><summary>Per-second timeline</summary><div class="scroll" id="timelinebody"></div></details>
@@ -98,6 +108,11 @@
       $('timeline').checked = false; $('timeline').disabled = true;
       document.querySelector('label[for=timeline]').parentElement.hidden = true;
       $('timelineHelp').hidden = true;
+    }
+    if (!c.breakdown_available) {
+      $('breakdown').checked = false; $('breakdown').disabled = true;
+      document.querySelector('label[for=breakdown]').parentElement.hidden = true;
+      $('breakdownHelp').hidden = true;
     }
     if (!c.transcript_available) {
       $('transcript').checked = false; $('transcript').disabled = true;
@@ -154,6 +169,50 @@
       return `<tr><td class="time">${fmtTime(r.start)} – ${fmtTime(r.end)}</td><td>${text}</td><td>${music}</td><td>${other}</td></tr>`;
     }).join('');
   }
+  let breakdownRows = null, breakdownName = 'breakdown';
+  const BD_COLS = [
+    ['time', 'Time'], ['dialogue', 'Dialogue'], ['audio', 'Audio'], ['entity', 'Entity'],
+    ['interpretation', 'Interpretation'], ['action', 'Action / blocking'],
+    ['performance', 'Performance / emotion'], ['camera', 'Camera'],
+  ];
+  function renderBreakdown(rows, cols, filename) {
+    breakdownRows = rows; breakdownName = filename || 'breakdown';
+    $('breakdownBlock').hidden = false;
+    $('breakdownEmpty').hidden = rows.length > 0;
+    const inferred = cols && cols.inferred && cols.inferred.length;
+    $('breakdownLegend').innerHTML = inferred
+      ? 'Dialogue, Audio and Entity are <b>detected</b> from the audio. <span class="inferred">Interpretation</span> is <b>inferred</b> by Claude. Action, Performance and Camera need video or the script.'
+      : 'Dialogue, Audio and Entity are <b>detected</b> from the audio. Interpretation is off (no API key configured). Action, Performance and Camera need video or the script.';
+    const head = '<tr>' + BD_COLS.map(c => `<th>${c[1]}</th>`).join('') + '</tr>';
+    $('breakdownTable').innerHTML = head + rows.map(r => {
+      const cells = [
+        `<td class="time">${fmtTime(r.start)}${r.end > r.start ? ' – ' + fmtTime(r.end) : ''}<div class="kind">${esc(r.kind)}</div></td>`,
+        `<td>${r.dialogue ? esc(r.dialogue) : '<span class="quiet">—</span>'}</td>`,
+        `<td>${r.audio ? esc(r.audio) : '<span class="quiet">—</span>'}${r.confidence != null ? ` <span class="quiet">(${r.confidence.toFixed(2)})</span>` : ''}</td>`,
+        `<td>${r.entity ? esc(r.entity) : '<span class="quiet">—</span>'}</td>`,
+        `<td class="inferred">${r.interpretation ? esc(r.interpretation) : '<span class="quiet">—</span>'}</td>`,
+        '<td class="quiet">—</td>', '<td class="quiet">—</td>', '<td class="quiet">—</td>',
+      ];
+      return '<tr>' + cells.join('') + '</tr>';
+    }).join('');
+  }
+  function csvCell(v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; }
+  $('breakdownCsv').addEventListener('click', () => {
+    if (!breakdownRows) return;
+    const lines = [BD_COLS.map(c => csvCell(c[1])).join(',')];
+    for (const r of breakdownRows) {
+      lines.push([
+        `${r.start}-${r.end}s`, r.dialogue, r.audio, r.entity,
+        r.interpretation, r.action, r.performance, r.camera,
+      ].map(csvCell).join(','));
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = breakdownName.replace(/\.[^.]+$/, '') + '-breakdown.csv';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
   async function parseResponse(r) {
     const text = await r.text();
     try { return JSON.parse(text); }
@@ -164,7 +223,8 @@
     const btn = $('go'); btn.disabled = true; btn.textContent = 'Analyzing…';
     const params = { top_k: $('topk').value, threshold: $('thr').value, segment_seconds: $('seg').value,
       timeline_seconds: $('timeline').checked ? 1 : 0,
-      transcript_table: $('transcript').checked };
+      transcript_table: $('transcript').checked,
+      breakdown: $('breakdown').checked };
     try {
       let r;
       if (cfg.bucket_upload && selected.size > cfg.direct_upload_max_mb * 1048576) {
@@ -194,6 +254,9 @@
         $('segments').hidden = false;
         $('segbody').innerHTML = data.segments.map(s => `<div class="segrow"><span class="t">${s.start}s – ${s.end}s</span><span>${s.tags.slice(0,3).map(t => `${t.label} (${t.probability.toFixed(2)})`).join(', ')}</span></div>`).join('');
       } else $('segments').hidden = true;
+      if (data.breakdown_table) renderBreakdown(data.breakdown_table, data.breakdown_columns, data.filename);
+      else $('breakdownBlock').hidden = true;
+      if (data.breakdown_unavailable) $('meta').innerHTML += ` <span class="err">${esc(data.breakdown_unavailable)}</span>`;
       if (data.transcript_table) renderTranscript(data.transcript_table);
       else $('transcriptBlock').hidden = true;
       if (data.transcript_unavailable) $('meta').innerHTML += ` <span class="err">${esc(data.transcript_unavailable)}</span>`;

@@ -393,3 +393,129 @@ class AudioTagger:
                 "other_sounds": self._top_k(other_probs, other_top_k, threshold),
             })
         return rows
+
+    # Sound classes that imply a physical source, used to fill the Entity column
+    # for event rows. Deliberately small and conservative: a guess here is worse
+    # than a blank, since the column is meant to read as detected fact.
+    ENTITY_HINTS = {
+        "Knock": "Door", "Door": "Door", "Doorbell": "Door", "Slam": "Door",
+        "Squeak": "Door/Hinge", "Sliding door": "Door", "Creak": "Door/Floor",
+        "Footsteps": "Person", "Walk, footsteps": "Person", "Clapping": "Person",
+        "Breathing": "Person", "Cough": "Person", "Sneeze": "Person",
+        "Laughter": "Person", "Gasp": "Person", "Cheering": "Crowd",
+        "Telephone": "Phone", "Telephone bell ringing": "Phone", "Ringtone": "Phone",
+        "Dishes, pots, and pans": "Kitchenware", "Cutlery, silverware": "Kitchenware",
+        "Water tap, faucet": "Tap", "Toilet flush": "Toilet", "Water": "Water",
+        "Car": "Vehicle", "Vehicle": "Vehicle", "Engine": "Vehicle",
+        "Car passing by": "Vehicle", "Bicycle": "Vehicle", "Train": "Vehicle",
+        "Glass": "Glass", "Shatter": "Glass", "Chink, clink": "Glass",
+        "Keys jangling": "Keys", "Typing": "Keyboard", "Computer keyboard": "Keyboard",
+        "Dog": "Dog", "Cat": "Cat", "Bird": "Bird",
+        "Wind": "Wind", "Rain": "Rain", "Thunder": "Weather",
+    }
+
+    def build_breakdown_table(
+        self,
+        waveform: np.ndarray,
+        transcriber=None,
+        diarizer=None,
+        threshold: float = 0.2,
+        event_threshold: float = 0.35,
+        merge_gap_seconds: float = 0.6,
+        min_turn_seconds: float = 0.4,
+        min_event_seconds: float = 0.15,
+        max_rows: int = 300,
+    ) -> Optional[List[dict]]:
+        """A production-style breakdown: one row per speech turn *and* per
+        notable sound event, sorted by time.
+
+        Speech rows carry the transcript (and a speaker label when a diarizer is
+        supplied); event rows carry the detected sound and a conservative entity
+        guess. Columns the audio cannot support (action, performance, camera)
+        are returned empty for a human or a later video stage to fill.
+        """
+        if self.sed_model is None:
+            return None
+
+        duration = waveform.shape[0] / self.sample_rate
+        framewise = self._forward_framewise(waveform[None, :])[0]
+        frames_per_second = self.sample_rate / self.hop_size
+
+        speech_idx = self._label_group_indices(
+            ["speech"], exact={"Conversation", "Narration, monologue", "Babbling", "Whispering"})
+        music_idx = self._label_group_indices(["music", "singing"])
+        spoken_or_musical = set(speech_idx) | set(music_idx)
+
+        # --- speech turns -------------------------------------------------
+        speech_mask = framewise[:, speech_idx].max(axis=1) >= threshold if speech_idx else \
+            np.zeros(framewise.shape[0], dtype=bool)
+        turns = self._merge_runs(speech_mask, frames_per_second, merge_gap_seconds, min_turn_seconds)
+
+        clips = []
+        for start_f, end_f in turns:
+            start_t, end_t = start_f / frames_per_second, min((end_f + 1) / frames_per_second, duration)
+            clips.append((waveform[int(start_t * self.sample_rate): int(end_t * self.sample_rate)],
+                          self.sample_rate))
+
+        speakers = [None] * len(turns)
+        if diarizer is not None and clips:
+            try:
+                speakers = diarizer.label_turns(clips)
+            except Exception:
+                speakers = [None] * len(turns)
+
+        rows = []
+        for (start_f, end_f), (clip, _), speaker in zip(turns, clips, speakers):
+            start_t = start_f / frames_per_second
+            end_t = min((end_f + 1) / frames_per_second, duration)
+            window = framewise[start_f : end_f + 1]
+            concurrent = window.max(axis=0).copy()
+            concurrent[list(spoken_or_musical)] = 0.0
+            music_present = bool(music_idx) and float(window[:, music_idx].max()) >= threshold
+            rows.append({
+                "kind": "speech",
+                "start": round(start_t, 2),
+                "end": round(end_t, 2),
+                "dialogue": transcriber.transcribe(clip, self.sample_rate) if transcriber else "",
+                "audio": "Music" if music_present else "",
+                "entity": speaker or "",
+                "confidence": round(float(window[:, speech_idx].max()), 3) if speech_idx else None,
+                "other_sounds": self._top_k(concurrent, 2, event_threshold),
+            })
+
+        # --- sound events (non-speech, non-music) -------------------------
+        above = framewise >= event_threshold
+        for class_idx in range(framewise.shape[1]):
+            if class_idx in spoken_or_musical:
+                continue
+            for start_f, end_f in self._merge_runs(above[:, class_idx], frames_per_second,
+                                                   merge_gap_seconds, min_event_seconds):
+                segment = framewise[start_f : end_f + 1, class_idx]
+                peak_f = start_f + int(np.argmax(segment))
+                label = self.labels[class_idx]
+                rows.append({
+                    "kind": "event",
+                    "start": round(start_f / frames_per_second, 2),
+                    "end": round(min((end_f + 1) / frames_per_second, duration), 2),
+                    "dialogue": "",
+                    "audio": label,
+                    "entity": self.ENTITY_HINTS.get(label, ""),
+                    "confidence": round(float(framewise[peak_f, class_idx]), 3),
+                    "other_sounds": [],
+                })
+
+        # Keep the most confident rows if there are too many, but always keep
+        # every speech row - the dialogue is the point of the table.
+        if len(rows) > max_rows:
+            speech_rows = [r for r in rows if r["kind"] == "speech"]
+            event_rows = sorted((r for r in rows if r["kind"] == "event"),
+                                key=lambda r: -(r["confidence"] or 0))
+            rows = speech_rows + event_rows[: max(0, max_rows - len(speech_rows))]
+        rows.sort(key=lambda r: (r["start"], r["kind"] != "speech"))
+
+        for row in rows:
+            row["interpretation"] = ""
+            row["action"] = ""
+            row["performance"] = ""
+            row["camera"] = ""
+        return rows
