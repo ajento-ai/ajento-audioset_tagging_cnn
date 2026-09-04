@@ -169,7 +169,7 @@ def labels():
 def _tag_local_file(tmp_path: str, filename: str, size: int, top_k: int, threshold: float,
                     segment_seconds: float, include_embedding: bool, timeline_seconds: float,
                     transcript_table: bool, breakdown: bool, t0: float,
-                    progress=None) -> dict:
+                    progress=None, script_elements=None, num_speakers=None) -> dict:
     def step(stage: str, fraction: float) -> None:
         if progress:
             progress(stage, fraction)
@@ -210,25 +210,55 @@ def _tag_local_file(tmp_path: str, filename: str, size: int, top_k: int, thresho
                 result["transcript_table"] = rows
         if breakdown:
             step("building breakdown", 0.55)
-            rows = tagger.build_breakdown_table(
-                waveform, transcriber=transcriber, diarizer=diarizer, cache=cache,
-                progress=lambda stage, frac: step(stage, 0.55 + 0.3 * frac))
-            if rows is None:
-                result["breakdown_unavailable"] = (
-                    "Breakdown table needs the sound event detection model, which is not loaded."
-                )
+            sub = lambda stage, frac: step(stage, 0.55 + 0.3 * frac)
+            if script_elements:
+                out = tagger.build_script_breakdown(waveform, script_elements, transcriber,
+                                                    cache=cache, progress=sub)
+                if out is None:
+                    result["breakdown_unavailable"] = (
+                        "Script alignment needs the sound event detection and speech-to-text models.")
+                    rows, meta = None, None
+                else:
+                    rows = out.pop("rows")
+                    meta = out
             else:
+                rows = tagger.build_breakdown_table(
+                    waveform, transcriber=transcriber, diarizer=diarizer, cache=cache,
+                    progress=sub, num_speakers=num_speakers)
+                meta = None
+                if rows is None:
+                    result["breakdown_unavailable"] = (
+                        "Breakdown table needs the sound event detection model, which is not loaded.")
+            if rows is not None:
+                for row in rows:
+                    for f in ("interpretation", "action", "performance", "camera"):
+                        row.setdefault(f, "")
                 if interpreter is not None and rows:
                     step("writing direction", 0.9)
-                    for row, suggestion in zip(rows, interpreter.annotate(rows)):
-                        row.update(suggestion)
+                    scene = meta.get("scene") if meta else None
+                    for row, suggestion in zip(rows, interpreter.annotate(
+                            rows, scene=scene, script_mode=bool(script_elements))):
+                        for f, value in suggestion.items():
+                            if value and not (f == "action" and row.get("kind") == "direction"):
+                                row[f] = value
                 result["breakdown_table"] = rows
-                result["breakdown_columns"] = {
-                    "detected": ["start", "end", "dialogue", "audio", "entity",
-                                 "confidence", "measured"],
-                    "suggested": (["interpretation", "action", "performance", "camera"]
-                                  if interpreter is not None else []),
-                }
+                if meta:
+                    result["script"] = meta
+                    result["breakdown_columns"] = {
+                        "mode": "script",
+                        "authored": ["dialogue", "entity", "notes", "action(direction rows)"],
+                        "detected": ["start", "end", "audio", "heard", "alignment", "measured"],
+                        "suggested": (["interpretation", "camera", "performance", "action(line rows)"]
+                                      if interpreter is not None else []),
+                    }
+                else:
+                    result["breakdown_columns"] = {
+                        "mode": "detected",
+                        "detected": ["start", "end", "dialogue", "audio", "entity",
+                                     "confidence", "measured"],
+                        "suggested": (["interpretation", "action", "performance", "camera"]
+                                      if interpreter is not None else []),
+                    }
     finally:
         try:
             os.remove(tmp_path)
@@ -262,6 +292,34 @@ def config():
         "diarization_available": diarizer is not None,
         "interpretation_available": interpreter is not None,
     }
+
+
+async def _read_script(upload: Optional[UploadFile]):
+    """Optional script (.pdf or text) -> parsed elements, or None."""
+    if upload is None or not upload.filename:
+        return None
+    from .script_parser import parse_script
+
+    data = await upload.read()
+    if not data:
+        return None
+    if upload.filename.lower().endswith(".pdf") or data[:5] == b"%PDF-":
+        import io
+        from pypdf import PdfReader
+
+        try:
+            reader = PdfReader(io.BytesIO(data))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read script PDF: {e}")
+    else:
+        text = data.decode("utf-8", errors="replace")
+    elements = parse_script(text)
+    if not any(e.kind == "line" for e in elements):
+        raise HTTPException(status_code=400,
+                            detail="Script has no dialogue lines I could recognise "
+                                   "(expected 'NAME:' cues with dialogue beneath).")
+    return elements
 
 
 async def _spool_upload(file: UploadFile):
@@ -324,16 +382,22 @@ async def tag_audio(
                                   description="Also return one row per speech turn with its transcript (slower)"),
     breakdown: bool = Form(default=False,
                            description="Also return the production breakdown table (speech turns + events)"),
+    script: Optional[UploadFile] = File(default=None,
+                                        description="Optional script (.pdf/.txt); aligns the recording to it"),
+    speakers: Optional[int] = Form(default=None, ge=1, le=12,
+                                   description="Known number of speakers (without a script)"),
 ):
     if tagger is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
     top_k = top_k or settings.default_top_k
 
     t0 = time.time()
+    elements = await _read_script(script)
     tmp_path, size, _ = await _spool_upload(file)
     return JSONResponse(_tag_local_file(tmp_path, file.filename, size, top_k, threshold,
                                         segment_seconds, include_embedding, timeline_seconds,
-                                        transcript_table, breakdown, t0))
+                                        transcript_table, breakdown, t0,
+                                        script_elements=elements, num_speakers=speakers))
 
 
 # ---------------------------------------------------------------- large files
@@ -370,7 +434,7 @@ def create_upload_session(req: UploadSessionRequest, request: Request):
 
 
 @app.post("/api/tag-object", dependencies=[Depends(require_api_key)])
-def tag_object(
+async def tag_object(
     object_name: str = Form(..., alias="object"),
     filename: str = Form(default=""),
     top_k: int = Form(default=None, ge=1, le=527),
@@ -380,6 +444,8 @@ def tag_object(
     timeline_seconds: float = Form(default=0.0, ge=0.0, le=10.0),
     transcript_table: bool = Form(default=False),
     breakdown: bool = Form(default=False),
+    script: Optional[UploadFile] = File(default=None),
+    speakers: Optional[int] = Form(default=None, ge=1, le=12),
 ):
     """Tag a file previously uploaded via /api/upload-session, then delete it."""
     if tagger is None:
@@ -388,10 +454,12 @@ def tag_object(
         raise HTTPException(status_code=400, detail="Invalid object name")
     top_k = top_k or settings.default_top_k
     t0 = time.time()
+    elements = await _read_script(script)
     tmp_path, size = _fetch_object(object_name)
     return JSONResponse(_tag_local_file(tmp_path, filename or os.path.basename(object_name), size,
                                         top_k, threshold, segment_seconds, include_embedding,
-                                        timeline_seconds, transcript_table, breakdown, t0))
+                                        timeline_seconds, transcript_table, breakdown, t0,
+                                        script_elements=elements, num_speakers=speakers))
 
 
 # ------------------------------------------------------------------ streaming
@@ -453,20 +521,24 @@ async def tag_audio_stream(
     timeline_seconds: float = Form(default=0.0, ge=0.0, le=10.0),
     transcript_table: bool = Form(default=False),
     breakdown: bool = Form(default=False),
+    script: Optional[UploadFile] = File(default=None),
+    speakers: Optional[int] = Form(default=None, ge=1, le=12),
 ):
     """Same as /api/tag, but streams progress events while it works."""
     if tagger is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
+    elements = await _read_script(script)
     tmp_path, size, filename = await _spool_upload(file)
     t0 = time.time()
     k = top_k or settings.default_top_k
     return _analysis_stream(lambda progress: _tag_local_file(
         tmp_path, filename, size, k, threshold, segment_seconds, include_embedding,
-        timeline_seconds, transcript_table, breakdown, t0, progress))
+        timeline_seconds, transcript_table, breakdown, t0, progress,
+        script_elements=elements, num_speakers=speakers))
 
 
 @app.post("/api/tag-object-stream", dependencies=[Depends(require_api_key)])
-def tag_object_stream(
+async def tag_object_stream(
     object_name: str = Form(..., alias="object"),
     filename: str = Form(default=""),
     top_k: int = Form(default=None, ge=1, le=527),
@@ -476,17 +548,21 @@ def tag_object_stream(
     timeline_seconds: float = Form(default=0.0, ge=0.0, le=10.0),
     transcript_table: bool = Form(default=False),
     breakdown: bool = Form(default=False),
+    script: Optional[UploadFile] = File(default=None),
+    speakers: Optional[int] = Form(default=None, ge=1, le=12),
 ):
     """Same as /api/tag-object, but streams progress events while it works."""
     if tagger is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet")
+    elements = await _read_script(script)
     tmp_path, size = _fetch_object(object_name)
     t0 = time.time()
     k = top_k or settings.default_top_k
     name = filename or os.path.basename(object_name)
     return _analysis_stream(lambda progress: _tag_local_file(
         tmp_path, name, size, k, threshold, segment_seconds, include_embedding,
-        timeline_seconds, transcript_table, breakdown, t0, progress))
+        timeline_seconds, transcript_table, breakdown, t0, progress,
+        script_elements=elements, num_speakers=speakers))
 
 
 @app.get("/", include_in_schema=False)

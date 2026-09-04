@@ -73,6 +73,36 @@ RESPONSE_SCHEMA = {
 }
 
 
+SCRIPT_SYSTEM = """You turn a timestamped script into shot direction for a team
+generating video from a recorded performance of it.
+
+Each row is a script element placed in time against the recording:
+- line rows: the character, the scripted dialogue, what Whisper actually heard
+  (for spotting deviations), authored performance notes from the script such as
+  "SHOUTING" or "BABY VOICE", and measured delivery cues (loudness dBFS, median
+  pitch and range in Hz, words per minute, pause before the line).
+- direction rows: the authored stage direction / sound cue, and the detected
+  sound that matched it (or the sounds heard nearby if none matched).
+The scene heading gives the location.
+
+For each row produce:
+- interpretation: what this beat is doing in the scene (max 12 words).
+- action: for line rows only, the physical business implied for the speaker
+  (max 10 words) consistent with the surrounding directions; "" if none.
+  For direction rows return "" - the authored direction already is the action.
+- performance: for line rows, how the line is delivered - start from the
+  authored notes, then use the measured cues to say more (max 10 words). ""
+  for direction rows.
+- camera: one shot suggestion that serves this beat (max 8 words), consistent
+  across neighbouring rows so the sequence cuts as one scene.
+
+Rules: never contradict the script; use character names as given; if a heard
+text clearly differs from the scripted line, mention it in interpretation
+("delivered as 'X' - deviates from script"). Return one entry per row, keyed by
+row index, same order.
+"""
+
+
 class Interpreter:
     """One structured-output call over the whole table."""
 
@@ -94,15 +124,17 @@ class Interpreter:
 
     FIELDS = ("interpretation", "action", "performance", "camera")
 
-    def annotate(self, rows: List[dict]) -> List[dict]:
+    def annotate(self, rows: List[dict], scene: Optional[str] = None,
+                 script_mode: bool = False) -> List[dict]:
         """One {interpretation, action, performance, camera} dict per row."""
         blank = [{f: "" for f in self.FIELDS} for _ in rows]
         if not rows:
             return []
         from google.genai import types
 
-        compact = [
-            {
+        compact = []
+        for i, r in enumerate(rows[: self.max_rows]):
+            item = {
                 "index": i,
                 "time": f'{r["start"]}-{r["end"]}s',
                 "kind": r["kind"],
@@ -111,14 +143,20 @@ class Interpreter:
                 "audio": r.get("audio") or "",
                 "measured": r.get("measured") or {},
             }
-            for i, r in enumerate(rows[: self.max_rows])
-        ]
+            if script_mode:
+                item["heard"] = (r.get("heard") or "")[:300]
+                item["authored_notes"] = r.get("notes") or []
+                item["authored_direction"] = r.get("action") or ""
+            compact.append(item)
+        prompt = "Rows:\n" + json.dumps(compact, ensure_ascii=False)
+        if scene:
+            prompt = f"Scene: {scene}\n" + prompt
         try:
             response = self.client.models.generate_content(
                 model=self.model,
-                contents="Rows:\n" + json.dumps(compact, ensure_ascii=False),
+                contents=prompt,
                 config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM,
+                    system_instruction=SCRIPT_SYSTEM if script_mode else SYSTEM,
                     response_mime_type="application/json",
                     response_schema=RESPONSE_SCHEMA,
                     temperature=0.2,

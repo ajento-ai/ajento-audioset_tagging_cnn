@@ -55,6 +55,10 @@
   .progress .track > i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .3s ease; }
   .progress .label { color: var(--muted); font-size: 13px; margin-top: 6px; display: flex; justify-content: space-between; }
   .measured { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .authored { color: #7fd6a4; }
+  .heard { color: var(--muted); font-size: 12px; margin-top: 3px; font-style: italic; }
+  .est { color: #e0b15c; }
+  .scriptmeta { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
   .kind { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 </style>
 </head>
@@ -74,6 +78,10 @@
       <div><label>Min probability</label><input type="number" id="thr" value="0.0" min="0" max="1" step="0.01"><div class="help">Hide labels scoring below this (0 = show all)</div></div>
       <div><label>Per-segment (sec)</label><input type="number" id="seg" value="10" min="0" max="60" step="1"><div class="help">Also tag each N-second window (0 = whole file only)</div></div>
       <div><button id="go" disabled>Analyze</button></div>
+    </div>
+    <div class="row">
+      <div><label>Script (optional, .pdf or .txt)</label><input type="file" id="script" accept=".pdf,.txt,text/plain,application/pdf" style="color:var(--muted);font-size:13px"><div class="help">With a script the table follows it: real character names, scripted lines placed in time, stage directions snapped to detected sounds.</div></div>
+      <div><label>Speakers (optional)</label><input type="number" id="speakers" min="1" max="12" placeholder="auto" style="width:90px"><div class="help">How many people speak. Used when no script is given; fixes over-splitting.</div></div>
     </div>
     <div class="progress" id="progress" hidden>
       <div class="track"><i id="progressBar"></i></div>
@@ -184,24 +192,40 @@
     ['interpretation', 'Interpretation'], ['action', 'Action / blocking'],
     ['performance', 'Performance / emotion'], ['camera', 'Camera'],
   ];
-  function renderBreakdown(rows, cols, filename) {
+  function renderBreakdown(rows, cols, filename, script) {
     breakdownRows = rows; breakdownName = filename || 'breakdown';
     $('breakdownBlock').hidden = false;
     $('breakdownEmpty').hidden = rows.length > 0;
     const suggested = cols && cols.suggested && cols.suggested.length;
-    $('breakdownLegend').innerHTML = suggested
-      ? 'Dialogue, Audio, Entity and the delivery cues are <b>detected</b> from the audio. <span class="inferred">Interpretation, Action, Performance and Camera</span> are <b>suggestions</b> written from those cues - direction to edit, not measurements.'
-      : 'Dialogue, Audio and Entity are <b>detected</b> from the audio. The direction columns are off (interpretation unavailable).';
+    const scriptMode = cols && cols.mode === 'script';
+    let meta = '';
+    if (script) {
+      meta = `<div class="scriptmeta">${script.scene ? esc(script.scene) + ' · ' : ''}Characters: ${(script.characters || []).map(esc).join(', ')} · ${script.lines_placed}/${script.lines_total} lines placed in the recording${script.lines_placed < script.lines_total ? ' <span class="est">(~ marks lines estimated from neighbours - likely cut, ad-libbed or inaudible)</span>' : ''}</div>`;
+    }
+    $('breakdownLegend').innerHTML = meta + (scriptMode
+      ? '<span class="authored">Green</span> is <b>from the script</b> (dialogue, characters, stage directions, performance notes). Timings, matched sounds, <i>heard</i> text and delivery cues are <b>detected</b> from the recording. ' + (suggested ? '<span class="inferred">Purple</span> is <b>suggested</b> direction written from both.' : 'Suggested direction is off.')
+      : (suggested
+        ? 'Dialogue, Audio, Entity and the delivery cues are <b>detected</b> from the audio. <span class="inferred">Interpretation, Action, Performance and Camera</span> are <b>suggestions</b> written from those cues - direction to edit, not measurements.'
+        : 'Dialogue, Audio and Entity are <b>detected</b> from the audio. The direction columns are off (interpretation unavailable).'));
     const head = '<tr>' + BD_COLS.map(c => `<th>${c[1]}</th>`).join('') + '</tr>';
     $('breakdownTable').innerHTML = head + rows.map(r => {
+      const isDir = r.kind === 'direction', isLine = r.kind === 'line';
+      const timeTxt = (r.estimated ? '<span class="est" title="estimated">~</span>' : '') + fmtTime(r.start) + (r.end > r.start ? ' – ' + fmtTime(r.end) : '');
+      let dialogue = r.dialogue ? `<span class="${scriptMode ? 'authored' : ''}">${esc(r.dialogue)}</span>` : '<span class="quiet">—</span>';
+      if (isLine && r.heard && r.alignment != null && r.alignment < 0.6) dialogue += `<div class="heard">heard: “${esc(r.heard)}”</div>`;
+      const notes = (r.notes && r.notes.length) ? `<span class="authored">${esc(r.notes.join(', '))}</span>` : '';
+      const performance = [notes, r.performance ? `<span class="inferred">${esc(r.performance)}</span>` : ''].filter(Boolean).join(' · ') || '<span class="quiet">—</span>';
+      const action = isDir && scriptMode
+        ? `<span class="authored">${esc(r.action)}</span>`
+        : (r.action ? `<span class="inferred">${esc(r.action)}</span>` : '<span class="quiet">—</span>');
       const cells = [
-        `<td class="time">${fmtTime(r.start)}${r.end > r.start ? ' – ' + fmtTime(r.end) : ''}<div class="kind">${esc(r.kind)}</div></td>`,
-        `<td>${r.dialogue ? esc(r.dialogue) : '<span class="quiet">—</span>'}</td>`,
+        `<td class="time">${timeTxt}<div class="kind">${esc(r.kind)}</div></td>`,
+        `<td>${dialogue}</td>`,
         `<td>${r.audio ? esc(r.audio) : '<span class="quiet">—</span>'}${r.confidence != null ? ` <span class="quiet">(${r.confidence.toFixed(2)})</span>` : ''}</td>`,
-        `<td>${r.entity ? esc(r.entity) : '<span class="quiet">—</span>'}${fmtMeasured(r.measured)}</td>`,
+        `<td>${r.entity ? `<span class="${scriptMode && isLine ? 'authored' : ''}">${esc(r.entity)}</span>` : '<span class="quiet">—</span>'}${fmtMeasured(r.measured)}</td>`,
         `<td class="inferred">${r.interpretation ? esc(r.interpretation) : '<span class="quiet">—</span>'}</td>`,
-        `<td class="inferred">${r.action ? esc(r.action) : '<span class="quiet">—</span>'}</td>`,
-        `<td class="inferred">${r.performance ? esc(r.performance) : '<span class="quiet">—</span>'}</td>`,
+        `<td>${action}</td>`,
+        `<td>${performance}</td>`,
         `<td class="inferred">${r.camera ? esc(r.camera) : '<span class="quiet">—</span>'}</td>`,
       ];
       return '<tr>' + cells.join('') + '</tr>';
@@ -219,13 +243,14 @@
   function csvCell(v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; }
   $('breakdownCsv').addEventListener('click', () => {
     if (!breakdownRows) return;
-    const extra = ['Loudness dBFS', 'Words/min', 'Pitch Hz', 'Pause before s'];
+    const extra = ['Heard', 'Alignment', 'Script notes', 'Estimated', 'Loudness dBFS', 'Words/min', 'Pitch Hz', 'Pause before s'];
     const lines = [BD_COLS.map(c => csvCell(c[1])).concat(extra.map(csvCell)).join(',')];
     for (const r of breakdownRows) {
       const m = r.measured || {};
       lines.push([
         `${r.start}-${r.end}s`, r.dialogue, r.audio, r.entity,
         r.interpretation, r.action, r.performance, r.camera,
+        r.heard, r.alignment, (r.notes || []).join('; '), r.estimated ? 'yes' : '',
         m.loudness_dbfs, m.words_per_minute, m.pitch_hz_median, m.pause_before,
       ].map(csvCell).join(','));
     }
@@ -245,6 +270,7 @@
     queued: 'Queued', uploading: 'Uploading', decoding: 'Decoding audio',
     tagging: 'Tagging audio', 'detecting events': 'Detecting events',
     'building breakdown': 'Building breakdown', diarizing: 'Identifying speakers',
+    'aligning script': 'Aligning script to audio',
     transcribing: 'Transcribing speech', assembling: 'Assembling table',
     'writing direction': 'Writing direction',
   };
@@ -292,6 +318,8 @@
       timeline_seconds: $('timeline').checked ? 1 : 0,
       transcript_table: $('transcript').checked,
       breakdown: $('breakdown').checked };
+    if ($('speakers').value) params.speakers = $('speakers').value;
+    const scriptFile = $('script').files[0] || null;
     try {
       setProgress('queued', 0);
       let data;
@@ -304,11 +332,13 @@
         const fd = new FormData();
         fd.append('object', sdata.object); fd.append('filename', selected.name);
         for (const [k, v] of Object.entries(params)) fd.append(k, v);
+        if (scriptFile) fd.append('script', scriptFile);
         data = await runStreaming('/api/tag-object-stream', fd);
       } else {
         const fd = new FormData();
         fd.append('file', selected);
         for (const [k, v] of Object.entries(params)) fd.append(k, v);
+        if (scriptFile) fd.append('script', scriptFile);
         data = await runStreaming('/api/tag-stream', fd);
       }
       setProgress('done', 1);
@@ -319,7 +349,7 @@
         $('segments').hidden = false;
         $('segbody').innerHTML = data.segments.map(s => `<div class="segrow"><span class="t">${s.start}s – ${s.end}s</span><span>${s.tags.slice(0,3).map(t => `${t.label} (${t.probability.toFixed(2)})`).join(', ')}</span></div>`).join('');
       } else $('segments').hidden = true;
-      if (data.breakdown_table) renderBreakdown(data.breakdown_table, data.breakdown_columns, data.filename);
+      if (data.breakdown_table) renderBreakdown(data.breakdown_table, data.breakdown_columns, data.filename, data.script);
       else $('breakdownBlock').hidden = true;
       if (data.breakdown_unavailable) $('meta').innerHTML += ` <span class="err">${esc(data.breakdown_unavailable)}</span>`;
       if (data.transcript_table) renderTranscript(data.transcript_table);

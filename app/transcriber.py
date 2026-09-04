@@ -78,6 +78,49 @@ class SpeechTranscriber:
                     texts[best] = (texts[best] + " " + text).strip()
         return texts
 
+    def transcribe_words(self, waveform: np.ndarray, sample_rate: int,
+                         spans: "list[tuple[float, float]]", hotwords: "list[str] | None" = None,
+                         window_seconds: float = 28.0) -> "list[dict]":
+        """Word-level timestamps over the given speech spans, in absolute seconds.
+
+        Spans are packed into shared windows like transcribe_turns. ``hotwords``
+        (character names etc.) bias recognition towards vocabulary the script
+        uses, which is where Whisper otherwise fails most visibly.
+        """
+        if not spans:
+            return []
+        groups, current = [], [0]
+        for i in range(1, len(spans)):
+            if spans[i][1] - spans[current[0]][0] <= window_seconds:
+                current.append(i)
+            else:
+                groups.append(current)
+                current = [i]
+        groups.append(current)
+
+        hint = ", ".join(hotwords) if hotwords else None
+        words: "list[dict]" = []
+        for group in groups:
+            g_start, g_end = spans[group[0]][0], spans[group[-1]][1]
+            clip = waveform[int(g_start * sample_rate): int(g_end * sample_rate)]
+            if clip.size == 0:
+                continue
+            if sample_rate != WHISPER_SAMPLE_RATE:
+                import librosa
+
+                clip = librosa.resample(np.asarray(clip, dtype=np.float32),
+                                        orig_sr=sample_rate, target_sr=WHISPER_SAMPLE_RATE)
+            segments, _ = self.model.transcribe(
+                np.asarray(clip, dtype=np.float32), beam_size=self.beam_size,
+                vad_filter=False, word_timestamps=True, hotwords=hint)
+            for segment in segments:
+                for w in segment.words or []:
+                    if w.word.strip():
+                        words.append({"start": round(g_start + w.start, 2),
+                                      "end": round(g_start + w.end, 2),
+                                      "word": w.word, "probability": round(w.probability, 3)})
+        return words
+
     def _segments(self, clip: np.ndarray, sample_rate: int, offset: float):
         """Yield (index, absolute_start, absolute_end, text) for one window."""
         if clip.size == 0:

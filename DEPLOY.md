@@ -175,6 +175,35 @@ weights are baked into the image at build time. If the model cannot be loaded
 the rest of the service still works and `GET /api/config` reports
 `transcript_available: false`, which hides the option in the UI.
 
+### Script alignment (best results)
+
+Upload the scene's script alongside the audio (`script` multipart field, .pdf
+or .txt) with `breakdown=true`, and the breakdown follows the script instead of
+guessing. Convention: a `NAME:` cue starts a character's dialogue; any line in
+ALL CAPS is a stage direction or sound cue; `(PARENTHETICALS)` inside dialogue
+are performance notes.
+
+- Dialogue lines are placed in time by aligning the script's words to
+  Whisper word timestamps (Whisper is fed the script's names as hotwords).
+  Each line reports `alignment` (0-1, share of its words found), `heard`
+  (what Whisper actually recognised, for spotting deviations) and `estimated`
+  (no words matched - likely cut, ad-libbed or inaudible - placed between its
+  neighbours).
+- Stage directions are placed in the gap between their neighbouring lines and
+  snapped to a matching detected sound there ("THUMPING AT THE DOOR" snaps to
+  the detected Knock; "SQUEAKS IT" to Squeak), clipped to that gap.
+- `entity` is the character name for lines, the implied source for directions.
+- `notes` carries the authored performance notes; `action` on direction rows is
+  the authored direction verbatim and is never overwritten by suggestions.
+
+The response adds `script` (scene heading, characters, lines placed/total) and
+`breakdown_columns.mode = "script"`, with columns grouped as authored /
+detected / suggested so the UI can colour them.
+
+Without a script, pass `speakers=N` (the known cast size) to cluster voices
+into exactly N speakers; guessing the count from a distance threshold tends to
+over-split when music runs under the dialogue.
+
 ### Breakdown table
 
 Pass `breakdown=true` to `/api/tag` or `/api/tag-object` for a production-style

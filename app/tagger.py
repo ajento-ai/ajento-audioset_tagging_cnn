@@ -473,6 +473,7 @@ class AudioTagger:
         max_rows: int = 300,
         cache: Optional[dict] = None,
         progress=None,
+        num_speakers: Optional[int] = None,
     ) -> Optional[List[dict]]:
         """A production-style breakdown: one row per speech turn *and* per
         notable sound event, sorted by time.
@@ -509,7 +510,7 @@ class AudioTagger:
         speakers = [None] * len(turns)
         if diarizer is not None and clips:
             try:
-                speakers = diarizer.label_turns(clips)
+                speakers = diarizer.label_turns(clips, num_speakers=num_speakers)
             except Exception:
                 speakers = [None] * len(turns)
 
@@ -585,3 +586,184 @@ class AudioTagger:
             row["performance"] = ""
             row["camera"] = ""
         return rows
+
+    # Words in stage directions -> AudioSet label fragments that would confirm
+    # them, plus the physical source for the Entity column. Matched against the
+    # detected events inside the direction's time window.
+    DIRECTION_CUES = [
+        (("knock", "thump", "hammer", "bang", "pound"), ("knock", "thump", "bang", "slam", "thud"), "Door"),
+        (("door",), ("door", "slam", "knock"), "Door"),
+        (("quack", "duck", "squeak"), ("squeak", "quack", "duck"), "Rubber duck"),
+        (("water", "sink", "tap", "splash", "shower"), ("water", "tap", "pour", "drip", "splash", "liquid", "gurgl"), "Water"),
+        (("music", "party", "atmosphere"), ("music",), "Party"),
+        (("curtain", "whisk", "snatch"), ("whoosh", "swish", "rustle", "fabric"), "Shower curtain"),
+        (("silence", "quiet", "peace"), ("silence",), ""),
+        (("giggle", "laugh"), ("laugh", "giggle", "chuckle"), ""),
+        (("hiccup",), ("hiccup",), ""),
+        (("shout", "scream", "yell"), ("shout", "yell", "scream"), ""),
+        (("footstep", "walk", "stagger", "run"), ("footstep", "walk", "run"), ""),
+        (("slump", "sit", "fall", "collapse"), ("thump", "thud"), ""),
+        (("glass", "bottle"), ("glass", "clink", "shatter"), "Glass"),
+        (("phone", "ring"), ("telephone", "ring"), "Phone"),
+    ]
+
+    def _direction_cue(self, text: str):
+        low = text.lower()
+        for triggers, label_fragments, entity in self.DIRECTION_CUES:
+            if any(t in low for t in triggers):
+                return label_fragments, entity
+        return (), ""
+
+    def build_script_breakdown(
+        self,
+        waveform: np.ndarray,
+        elements,
+        transcriber,
+        threshold: float = 0.2,
+        event_threshold: float = 0.3,
+        merge_gap_seconds: float = 0.6,
+        min_turn_seconds: float = 0.4,
+        cache: Optional[dict] = None,
+        progress=None,
+    ) -> Optional[dict]:
+        """Timestamp a script against the recording.
+
+        The script is authoritative for who speaks and what they say; the audio
+        supplies *when*. Dialogue lines are placed by aligning script words to
+        Whisper word timestamps; stage directions are placed in the gap between
+        their neighbouring lines and snapped to a matching detected sound when
+        one exists there (a "THUMPING AT THE DOOR" direction snaps to the
+        detected Knock). Rows keep script order.
+        """
+        if self.sed_model is None or transcriber is None:
+            return None
+        from .aligner import place_lines
+        from .script_parser import characters, proper_nouns
+
+        duration = waveform.shape[0] / self.sample_rate
+        framewise = self.framewise(waveform, cache)
+        fps = self.sample_rate / self.hop_size
+
+        # 1. speech spans -> word timestamps (with script vocabulary as hints)
+        speech_idx = self._label_group_indices(
+            ["speech"], exact={"Conversation", "Narration, monologue", "Babbling", "Whispering"})
+        speech_mask = framewise[:, speech_idx].max(axis=1) >= threshold
+        spans = [(a / fps, min((b + 1) / fps, duration))
+                 for a, b in self._merge_runs(speech_mask, fps, merge_gap_seconds, min_turn_seconds)]
+        if progress:
+            progress("transcribing", 0.0)
+        words = transcriber.transcribe_words(waveform, self.sample_rate, spans,
+                                             hotwords=proper_nouns(elements))
+
+        # 2. place dialogue lines
+        if progress:
+            progress("aligning script", 0.6)
+        line_elements = [e for e in elements if e.kind == "line"]
+        placed = place_lines([e.text for e in line_elements], words)
+        timing = {e.index: pl for e, pl in zip(line_elements, placed)}
+
+        # 3. detected events, for snapping directions and filling Audio
+        music_idx = set(self._label_group_indices(["music", "singing"]))
+        skip = set(speech_idx) | music_idx
+        events = []
+        above = framewise >= event_threshold
+        for ci in range(framewise.shape[1]):
+            if ci in skip:
+                continue
+            for a, b in self._merge_runs(above[:, ci], fps, 0.5, 0.1):
+                peak = a + int(np.argmax(framewise[a:b + 1, ci]))
+                events.append({"label": self.labels[ci], "start": a / fps, "end": (b + 1) / fps,
+                               "peak_time": peak / fps, "prob": float(framewise[peak, ci])})
+        events.sort(key=lambda e: e["start"])
+
+        def events_between(t0: float, t1: float):
+            return [e for e in events if e["end"] >= t0 and e["start"] <= t1]
+
+        # 4. rows in script order
+        rows, scene = [], None
+        n = len(elements)
+        for i, el in enumerate(elements):
+            if el.kind == "scene":
+                scene = el.text
+                continue
+            if el.kind == "line":
+                pl = timing[el.index]
+                a_f, b_f = int(pl["start"] * fps), max(int(pl["start"] * fps) + 1, int(pl["end"] * fps))
+                window = framewise[a_f:b_f] if b_f > a_f and a_f < framewise.shape[0] else framewise[:1]
+                music_present = bool(music_idx) and float(window[:, sorted(music_idx)].max()) >= threshold
+                clip = waveform[int(pl["start"] * self.sample_rate): int(pl["end"] * self.sample_rate)]
+                concurrent = [e["label"] for e in events_between(pl["start"], pl["end"])
+                              if e["prob"] >= 0.4][:2]
+                rows.append({
+                    "kind": "line",
+                    "start": pl["start"], "end": pl["end"],
+                    "dialogue": el.text,
+                    "heard": pl["heard"],
+                    "alignment": pl["coverage"],
+                    "estimated": pl["estimated"],
+                    "audio": ", ".join((["Music"] if music_present else []) + concurrent),
+                    "entity": el.character.title() if el.character else "",
+                    "notes": el.notes,                       # authored performance notes
+                    "measured": self._delivery_metrics(clip, el.text, max(0.0, pl["end"] - pl["start"]), 0.0)
+                    if clip.size else {},
+                })
+                continue
+
+            # direction: window between neighbouring placed lines
+            prev_end = next((timing[elements[k].index]["end"] for k in range(i - 1, -1, -1)
+                             if elements[k].kind == "line"), 0.0)
+            next_start = next((timing[elements[k].index]["start"] for k in range(i + 1, n)
+                               if elements[k].kind == "line"), duration)
+            if next_start < prev_end:
+                next_start = prev_end
+            fragments, entity = self._direction_cue(el.text)
+            lo, hi = prev_end - 0.5, next_start + 0.5
+            candidates = events_between(lo, hi)
+            match = None
+            if fragments:
+                hits = [e for e in candidates if any(f in e["label"].lower() for f in fragments)]
+                if hits:
+                    # prefer a sound that peaks inside this gap; the direction
+                    # belongs here even if the detection also runs on past it
+                    inside = [e for e in hits if lo <= e["peak_time"] <= hi]
+                    match = max(inside or hits, key=lambda e: e["prob"])
+            if match:
+                # clip the detection to the window so a long-running sound
+                # (music, a tap left on) cannot stretch the direction over
+                # the lines around it
+                m_start = max(match["start"], prev_end)
+                m_end = min(match["end"], next_start)
+                if m_end <= m_start:
+                    m_start = min(max(match["peak_time"], prev_end), next_start)
+                    m_end = m_start
+            rows.append({
+                "kind": "direction",
+                "start": round(m_start if match else prev_end, 2),
+                "end": round(m_end if match else next_start, 2),
+                "dialogue": "",
+                "heard": "",
+                "alignment": None,
+                "estimated": match is None,
+                "action": el.text,                            # authored
+                "audio": (f'{match["label"]} ({match["prob"]:.2f})' if match else
+                          ", ".join(f'{e["label"]}' for e in sorted(candidates, key=lambda e: -e["prob"])[:2])),
+                "entity": entity,
+                "notes": [],
+                "measured": {},
+            })
+
+        # pause before each line, now that everything is placed
+        last_end = 0.0
+        for r in rows:
+            if r["kind"] == "line":
+                r["measured"]["pause_before"] = round(max(0.0, r["start"] - last_end), 2)
+            last_end = max(last_end, r["end"])
+
+        return {
+            "scene": scene,
+            "characters": [c.title() for c in characters(elements)],
+            "rows": rows,
+            "words_recognised": len(words),
+            "lines_placed": sum(1 for r in rows if r["kind"] == "line" and not r["estimated"]),
+            "lines_total": sum(1 for r in rows if r["kind"] == "line"),
+        }
