@@ -20,20 +20,32 @@ log = logging.getLogger("audiotagging.interpreter")
 # "global" location, not regional endpoints such as us-central1.
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
-SYSTEM = """You annotate an audio breakdown for a film/production team.
+SYSTEM = """You turn a detected audio breakdown into shot direction for a team
+generating video from this audio.
 
-You receive rows detected from an audio track. Each row is either a stretch of
-speech (with a transcript) or a detected sound event, with a timestamp.
+Each row is either a stretch of speech (with a transcript) or a detected sound
+event, with a timestamp. Speech rows may carry measured delivery cues:
+loudness in dBFS, median pitch and pitch range in Hz, words per minute, and the
+pause before the line. Use those cues as evidence for how a line is delivered -
+a loud, wide-pitch, fast line reads as agitated; a quiet, narrow, slow one after
+a long pause reads as subdued.
 
-For each row, write one short interpretation (max 12 words) of what is likely
-happening at that moment, using the surrounding rows for context. Examples:
-"Knock from outside the room", "Jane reacts", "Music swells under dialogue".
+For each row produce four short fields:
+- interpretation: what is happening at this moment (max 12 words).
+- action: the physical action or blocking implied (max 10 words), "" if the
+  audio implies none.
+- performance: how the line is delivered, grounded in the measured cues
+  (max 8 words), "" for non-speech rows.
+- camera: one shot suggestion that serves this beat (max 8 words), e.g.
+  "close on reacting listener", "wide, hold on doorway".
 
 Rules:
-- Base it on the given rows only. Never invent dialogue, names, or locations
-  that the rows do not support.
-- If a row is ambiguous, say the plain reading ("Impact sound, source unclear")
-  rather than guessing a specific cause.
+- interpretation must stay faithful to the rows: never invent dialogue, names
+  or locations they do not support. If a row is ambiguous, give the plain
+  reading ("Impact sound, source unclear") rather than guessing a cause.
+- action, performance and camera are creative suggestions, not claims about the
+  recording. Keep them consistent with neighbouring rows so the sequence reads
+  as one scene.
 - Refer to speakers exactly as the rows label them (e.g. "Speaker 1"), unless
   the transcript itself names someone.
 - Return one entry per input row, in the same order, keyed by row index.
@@ -49,8 +61,11 @@ RESPONSE_SCHEMA = {
                 "properties": {
                     "index": {"type": "integer"},
                     "interpretation": {"type": "string"},
+                    "action": {"type": "string"},
+                    "performance": {"type": "string"},
+                    "camera": {"type": "string"},
                 },
-                "required": ["index", "interpretation"],
+                "required": ["index", "interpretation", "action", "performance", "camera"],
             },
         }
     },
@@ -77,8 +92,11 @@ class Interpreter:
             self.client = genai.Client(vertexai=True, project=project, location=location)
             self.mode = "vertex"
 
-    def annotate(self, rows: List[dict]) -> List[str]:
-        """One interpretation string per row (empty strings if the call fails)."""
+    FIELDS = ("interpretation", "action", "performance", "camera")
+
+    def annotate(self, rows: List[dict]) -> List[dict]:
+        """One {interpretation, action, performance, camera} dict per row."""
+        blank = [{f: "" for f in self.FIELDS} for _ in rows]
         if not rows:
             return []
         from google.genai import types
@@ -91,6 +109,7 @@ class Interpreter:
                 "speaker": r.get("entity") or "",
                 "dialogue": (r.get("dialogue") or "")[:300],
                 "audio": r.get("audio") or "",
+                "measured": r.get("measured") or {},
             }
             for i, r in enumerate(rows[: self.max_rows])
         ]
@@ -106,9 +125,11 @@ class Interpreter:
                 ),
             )
             payload = json.loads(response.text)
-            by_index = {int(item["index"]): item.get("interpretation", "")
-                        for item in payload.get("rows", [])}
+            by_index = {
+                int(item["index"]): {f: str(item.get(f, "") or "") for f in self.FIELDS}
+                for item in payload.get("rows", [])
+            }
         except Exception:
             log.exception("Interpretation call failed (model=%s, mode=%s)", self.model, self.mode)
-            return [""] * len(rows)
-        return [by_index.get(i, "") for i in range(len(rows))]
+            return blank
+        return [by_index.get(i, {f: "" for f in self.FIELDS}) for i in range(len(rows))]

@@ -5,6 +5,7 @@ Run locally:
 
 Configuration is via environment variables (see ``Settings``).
 """
+import json
 import logging
 import os
 import tempfile
@@ -15,7 +16,7 @@ import uuid
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .tagger import AudioTagger
@@ -167,17 +168,28 @@ def labels():
 
 def _tag_local_file(tmp_path: str, filename: str, size: int, top_k: int, threshold: float,
                     segment_seconds: float, include_embedding: bool, timeline_seconds: float,
-                    transcript_table: bool, breakdown: bool, t0: float) -> dict:
+                    transcript_table: bool, breakdown: bool, t0: float,
+                    progress=None) -> dict:
+    def step(stage: str, fraction: float) -> None:
+        if progress:
+            progress(stage, fraction)
+
+    # One frame-level pass shared by the timeline and the breakdown table.
+    cache: dict = {}
     try:
+        step("decoding", 0.05)
         try:
             waveform = tagger.decode_audio(tmp_path, max_seconds=settings.max_duration_seconds)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        step("tagging", 0.15)
         result = tagger.tag(waveform, top_k=top_k, threshold=threshold,
                             segment_seconds=segment_seconds, include_embedding=include_embedding)
         if timeline_seconds:
+            step("detecting events", 0.4)
             events_out = tagger.detect_events(waveform, bin_seconds=timeline_seconds,
-                                              top_k=min(top_k, 5), threshold=max(threshold, 0.15))
+                                              top_k=min(top_k, 5), threshold=max(threshold, 0.15),
+                                              cache=cache)
             if events_out is None:
                 result["timeline_unavailable"] = (
                     "Timestamped timeline is not available: the server has no "
@@ -195,21 +207,25 @@ def _tag_local_file(tmp_path: str, filename: str, size: int, top_k: int, thresho
             else:
                 result["transcript_table"] = rows
         if breakdown:
-            rows = tagger.build_breakdown_table(waveform, transcriber=transcriber,
-                                                diarizer=diarizer)
+            step("building breakdown", 0.55)
+            rows = tagger.build_breakdown_table(
+                waveform, transcriber=transcriber, diarizer=diarizer, cache=cache,
+                progress=lambda stage, frac: step(stage, 0.55 + 0.3 * frac))
             if rows is None:
                 result["breakdown_unavailable"] = (
                     "Breakdown table needs the sound event detection model, which is not loaded."
                 )
             else:
                 if interpreter is not None and rows:
-                    for row, text in zip(rows, interpreter.annotate(rows)):
-                        row["interpretation"] = text
+                    step("writing direction", 0.9)
+                    for row, suggestion in zip(rows, interpreter.annotate(rows)):
+                        row.update(suggestion)
                 result["breakdown_table"] = rows
                 result["breakdown_columns"] = {
-                    "detected": ["start", "end", "dialogue", "audio", "entity", "confidence"],
-                    "inferred": ["interpretation"] if interpreter is not None else [],
-                    "empty_for_video_or_script": ["action", "performance", "camera"],
+                    "detected": ["start", "end", "dialogue", "audio", "entity",
+                                 "confidence", "measured"],
+                    "suggested": (["interpretation", "action", "performance", "camera"]
+                                  if interpreter is not None else []),
                 }
     finally:
         try:
@@ -246,6 +262,52 @@ def config():
     }
 
 
+async def _spool_upload(file: UploadFile):
+    """Stream an upload to a temp file, enforcing the size cap. -> (path, size, name)"""
+    limit = settings.max_upload_mb * 1024 * 1024
+    suffix = os.path.splitext(file.filename or "")[1][:10] or ".bin"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        size = 0
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > limit:
+                tmp.close()
+                os.remove(tmp.name)
+                raise HTTPException(status_code=413,
+                                    detail=f"File exceeds {settings.max_upload_mb} MB limit")
+            tmp.write(chunk)
+        tmp_path = tmp.name
+    if size == 0:
+        os.remove(tmp_path)
+        raise HTTPException(status_code=400, detail="Empty upload")
+    return tmp_path, size, file.filename
+
+
+def _fetch_object(object_name: str):
+    """Download a bucket upload to a temp file and delete the object. -> (path, size)"""
+    if not object_name.startswith("uploads/") or "/" in object_name[len("uploads/"):]:
+        raise HTTPException(status_code=400, detail="Invalid object name")
+    blob = _gcs_bucket().blob(object_name)
+    suffix = os.path.splitext(object_name)[1] or ".bin"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        blob.download_to_filename(tmp_path)
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise HTTPException(status_code=404, detail=f"Uploaded file not found: {e}")
+    finally:
+        try:
+            blob.delete()
+        except Exception:
+            pass
+    return tmp_path, os.path.getsize(tmp_path)
+
+
 @app.post("/api/tag", dependencies=[Depends(require_api_key)])
 async def tag_audio(
     file: UploadFile = File(..., description="Audio file (wav, mp3, m4a, flac, ogg, webm...)"),
@@ -265,26 +327,8 @@ async def tag_audio(
         raise HTTPException(status_code=503, detail="Model not loaded yet")
     top_k = top_k or settings.default_top_k
 
-    limit = settings.max_upload_mb * 1024 * 1024
-    suffix = os.path.splitext(file.filename or "")[1][:10] or ".bin"
     t0 = time.time()
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        size = 0
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > limit:
-                tmp.close()
-                os.remove(tmp.name)
-                raise HTTPException(status_code=413,
-                                    detail=f"File exceeds {settings.max_upload_mb} MB limit")
-            tmp.write(chunk)
-        tmp_path = tmp.name
-    if size == 0:
-        os.remove(tmp_path)
-        raise HTTPException(status_code=400, detail="Empty upload")
+    tmp_path, size, _ = await _spool_upload(file)
     return JSONResponse(_tag_local_file(tmp_path, file.filename, size, top_k, threshold,
                                         segment_seconds, include_embedding, timeline_seconds,
                                         transcript_table, breakdown, t0))
@@ -342,25 +386,105 @@ def tag_object(
         raise HTTPException(status_code=400, detail="Invalid object name")
     top_k = top_k or settings.default_top_k
     t0 = time.time()
-    blob = _gcs_bucket().blob(object_name)
-    suffix = os.path.splitext(object_name)[1] or ".bin"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        blob.download_to_filename(tmp_path)
-    except Exception as e:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise HTTPException(status_code=404, detail=f"Uploaded file not found: {e}")
-    finally:
-        try:
-            blob.delete()
-        except Exception:
-            pass
-    size = os.path.getsize(tmp_path)
+    tmp_path, size = _fetch_object(object_name)
     return JSONResponse(_tag_local_file(tmp_path, filename or os.path.basename(object_name), size,
                                         top_k, threshold, segment_seconds, include_embedding,
                                         timeline_seconds, transcript_table, breakdown, t0))
+
+
+# ------------------------------------------------------------------ streaming
+def _sse(event: str, payload: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+
+
+def _analysis_stream(run):
+    """Run a blocking analysis in a worker thread, streaming progress as SSE.
+
+    The work is CPU-bound and takes a minute or two, so the browser needs to
+    see stages rather than a spinner that might be a hung request.
+    """
+    import queue
+    import threading
+
+    updates: "queue.Queue" = queue.Queue()
+
+    def progress(stage: str, fraction: float) -> None:
+        updates.put(("progress", {"stage": stage, "fraction": round(float(fraction), 3)}))
+
+    def worker() -> None:
+        try:
+            updates.put(("result", run(progress)))
+        except HTTPException as e:
+            updates.put(("error", {"detail": e.detail, "status": e.status_code}))
+        except Exception as e:
+            log.exception("Analysis failed")
+            updates.put(("error", {"detail": str(e), "status": 500}))
+        finally:
+            updates.put((None, None))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def generate():
+        yield _sse("progress", {"stage": "queued", "fraction": 0.0})
+        while True:
+            try:
+                kind, payload = updates.get(timeout=15)
+            except queue.Empty:
+                yield ": keep-alive\n\n"   # stop proxies closing an idle stream
+                continue
+            if kind is None:
+                break
+            yield _sse(kind, payload)
+
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/tag-stream", dependencies=[Depends(require_api_key)])
+async def tag_audio_stream(
+    file: UploadFile = File(...),
+    top_k: int = Form(default=None, ge=1, le=527),
+    threshold: float = Form(default=0.0, ge=0.0, le=1.0),
+    segment_seconds: float = Form(default=0.0, ge=0.0, le=60.0),
+    include_embedding: bool = Form(default=False),
+    timeline_seconds: float = Form(default=0.0, ge=0.0, le=10.0),
+    transcript_table: bool = Form(default=False),
+    breakdown: bool = Form(default=False),
+):
+    """Same as /api/tag, but streams progress events while it works."""
+    if tagger is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet")
+    tmp_path, size, filename = await _spool_upload(file)
+    t0 = time.time()
+    k = top_k or settings.default_top_k
+    return _analysis_stream(lambda progress: _tag_local_file(
+        tmp_path, filename, size, k, threshold, segment_seconds, include_embedding,
+        timeline_seconds, transcript_table, breakdown, t0, progress))
+
+
+@app.post("/api/tag-object-stream", dependencies=[Depends(require_api_key)])
+def tag_object_stream(
+    object_name: str = Form(..., alias="object"),
+    filename: str = Form(default=""),
+    top_k: int = Form(default=None, ge=1, le=527),
+    threshold: float = Form(default=0.0, ge=0.0, le=1.0),
+    segment_seconds: float = Form(default=0.0, ge=0.0, le=60.0),
+    include_embedding: bool = Form(default=False),
+    timeline_seconds: float = Form(default=0.0, ge=0.0, le=10.0),
+    transcript_table: bool = Form(default=False),
+    breakdown: bool = Form(default=False),
+):
+    """Same as /api/tag-object, but streams progress events while it works."""
+    if tagger is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet")
+    tmp_path, size = _fetch_object(object_name)
+    t0 = time.time()
+    k = top_k or settings.default_top_k
+    name = filename or os.path.basename(object_name)
+    return _analysis_stream(lambda progress: _tag_local_file(
+        tmp_path, name, size, k, threshold, segment_seconds, include_embedding,
+        timeline_seconds, transcript_table, breakdown, t0, progress))
 
 
 @app.get("/", include_in_schema=False)

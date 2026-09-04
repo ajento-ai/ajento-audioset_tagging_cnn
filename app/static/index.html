@@ -50,6 +50,11 @@
   .inferred { color: #c3a6ff; }
   .legend { color: var(--muted); font-size: 12px; margin: 8px 0; }
   .dl { background: transparent; border: 1px solid #3a4050; color: var(--fg); padding: 6px 12px; font-size: 13px; border-radius: 6px; margin-top: 10px; }
+  .progress { margin-top: 16px; }
+  .progress .track { height: 6px; background: var(--bar); border-radius: 3px; overflow: hidden; }
+  .progress .track > i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .3s ease; }
+  .progress .label { color: var(--muted); font-size: 13px; margin-top: 6px; display: flex; justify-content: space-between; }
+  .measured { color: var(--muted); font-size: 11px; white-space: nowrap; }
   .kind { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 </style>
 </head>
@@ -69,6 +74,10 @@
       <div><label>Min probability</label><input type="number" id="thr" value="0.0" min="0" max="1" step="0.01"><div class="help">Hide labels scoring below this (0 = show all)</div></div>
       <div><label>Per-segment (sec)</label><input type="number" id="seg" value="10" min="0" max="60" step="1"><div class="help">Also tag each N-second window (0 = whole file only)</div></div>
       <div><button id="go" disabled>Analyze</button></div>
+    </div>
+    <div class="progress" id="progress" hidden>
+      <div class="track"><i id="progressBar"></i></div>
+      <div class="label"><span id="progressStage">Starting…</span><span id="progressPct"></span></div>
     </div>
     <div class="toggle">
       <input type="checkbox" id="timeline" checked>
@@ -179,31 +188,45 @@
     breakdownRows = rows; breakdownName = filename || 'breakdown';
     $('breakdownBlock').hidden = false;
     $('breakdownEmpty').hidden = rows.length > 0;
-    const inferred = cols && cols.inferred && cols.inferred.length;
-    $('breakdownLegend').innerHTML = inferred
-      ? 'Dialogue, Audio and Entity are <b>detected</b> from the audio. <span class="inferred">Interpretation</span> is <b>inferred</b> by Claude. Action, Performance and Camera need video or the script.'
-      : 'Dialogue, Audio and Entity are <b>detected</b> from the audio. Interpretation is off (no API key configured). Action, Performance and Camera need video or the script.';
+    const suggested = cols && cols.suggested && cols.suggested.length;
+    $('breakdownLegend').innerHTML = suggested
+      ? 'Dialogue, Audio, Entity and the delivery cues are <b>detected</b> from the audio. <span class="inferred">Interpretation, Action, Performance and Camera</span> are <b>suggestions</b> written from those cues - direction to edit, not measurements.'
+      : 'Dialogue, Audio and Entity are <b>detected</b> from the audio. The direction columns are off (interpretation unavailable).';
     const head = '<tr>' + BD_COLS.map(c => `<th>${c[1]}</th>`).join('') + '</tr>';
     $('breakdownTable').innerHTML = head + rows.map(r => {
       const cells = [
         `<td class="time">${fmtTime(r.start)}${r.end > r.start ? ' – ' + fmtTime(r.end) : ''}<div class="kind">${esc(r.kind)}</div></td>`,
         `<td>${r.dialogue ? esc(r.dialogue) : '<span class="quiet">—</span>'}</td>`,
         `<td>${r.audio ? esc(r.audio) : '<span class="quiet">—</span>'}${r.confidence != null ? ` <span class="quiet">(${r.confidence.toFixed(2)})</span>` : ''}</td>`,
-        `<td>${r.entity ? esc(r.entity) : '<span class="quiet">—</span>'}</td>`,
+        `<td>${r.entity ? esc(r.entity) : '<span class="quiet">—</span>'}${fmtMeasured(r.measured)}</td>`,
         `<td class="inferred">${r.interpretation ? esc(r.interpretation) : '<span class="quiet">—</span>'}</td>`,
-        '<td class="quiet">—</td>', '<td class="quiet">—</td>', '<td class="quiet">—</td>',
+        `<td class="inferred">${r.action ? esc(r.action) : '<span class="quiet">—</span>'}</td>`,
+        `<td class="inferred">${r.performance ? esc(r.performance) : '<span class="quiet">—</span>'}</td>`,
+        `<td class="inferred">${r.camera ? esc(r.camera) : '<span class="quiet">—</span>'}</td>`,
       ];
       return '<tr>' + cells.join('') + '</tr>';
     }).join('');
   }
+  function fmtMeasured(m) {
+    if (!m) return '';
+    const bits = [];
+    if (m.loudness_dbfs != null) bits.push(`${m.loudness_dbfs} dBFS`);
+    if (m.words_per_minute != null) bits.push(`${m.words_per_minute} wpm`);
+    if (m.pitch_hz_median != null) bits.push(`${m.pitch_hz_median} Hz`);
+    if (m.pause_before) bits.push(`pause ${m.pause_before}s`);
+    return bits.length ? `<div class="measured">${esc(bits.join(' · '))}</div>` : '';
+  }
   function csvCell(v) { return '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; }
   $('breakdownCsv').addEventListener('click', () => {
     if (!breakdownRows) return;
-    const lines = [BD_COLS.map(c => csvCell(c[1])).join(',')];
+    const extra = ['Loudness dBFS', 'Words/min', 'Pitch Hz', 'Pause before s'];
+    const lines = [BD_COLS.map(c => csvCell(c[1])).concat(extra.map(csvCell)).join(',')];
     for (const r of breakdownRows) {
+      const m = r.measured || {};
       lines.push([
         `${r.start}-${r.end}s`, r.dialogue, r.audio, r.entity,
         r.interpretation, r.action, r.performance, r.camera,
+        m.loudness_dbfs, m.words_per_minute, m.pitch_hz_median, m.pause_before,
       ].map(csvCell).join(','));
     }
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
@@ -218,6 +241,50 @@
     try { return JSON.parse(text); }
     catch { return { detail: r.status === 413 ? 'File too large.' : (r.status === 504 || r.status === 502 ? 'The server took too long or was unavailable. Try a shorter clip.' : text.replace(/<[^>]+>/g, ' ').trim().slice(0, 200)) }; }
   }
+  const STAGE_TEXT = {
+    queued: 'Queued', uploading: 'Uploading', decoding: 'Decoding audio',
+    tagging: 'Tagging audio', 'detecting events': 'Detecting events',
+    'building breakdown': 'Building breakdown', diarizing: 'Identifying speakers',
+    transcribing: 'Transcribing speech', assembling: 'Assembling table',
+    'writing direction': 'Writing direction',
+  };
+  function setProgress(stage, fraction) {
+    $('progress').hidden = false;
+    $('progressStage').textContent = STAGE_TEXT[stage] || stage;
+    if (fraction != null) {
+      $('progressBar').style.width = Math.round(fraction * 100) + '%';
+      $('progressPct').textContent = Math.round(fraction * 100) + '%';
+    }
+  }
+  // Reads the SSE stream and resolves with the final result payload.
+  async function runStreaming(url, fd) {
+    const r = await fetch(url, { method: 'POST', body: fd });
+    if (!r.ok || !r.body) {
+      const data = await parseResponse(r);
+      throw new Error(data.detail || `Request failed (${r.status})`);
+    }
+    const reader = r.body.getReader(), decoder = new TextDecoder();
+    let buffer = '', result = null, failure = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const chunks = buffer.split('\n\n');
+      buffer = chunks.pop();
+      for (const chunk of chunks) {
+        const ev = /^event: (.+)$/m.exec(chunk);
+        const dt = /^data: (.+)$/m.exec(chunk);
+        if (!ev || !dt) continue;
+        const payload = JSON.parse(dt[1]);
+        if (ev[1] === 'progress') setProgress(payload.stage, payload.fraction);
+        else if (ev[1] === 'result') result = payload;
+        else if (ev[1] === 'error') failure = payload;
+      }
+    }
+    if (failure) throw new Error(failure.detail || 'Analysis failed');
+    if (!result) throw new Error('Analysis ended without returning a result');
+    return result;
+  }
   $('go').addEventListener('click', async () => {
     if (!selected) return;
     const btn = $('go'); btn.disabled = true; btn.textContent = 'Analyzing…';
@@ -226,28 +293,26 @@
       transcript_table: $('transcript').checked,
       breakdown: $('breakdown').checked };
     try {
-      let r;
+      setProgress('queued', 0);
+      let data;
       if (cfg.bucket_upload && selected.size > cfg.direct_upload_max_mb * 1048576) {
-        btn.textContent = 'Uploading… 0%';
         const sess = await fetch('/api/upload-session', { method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ filename: selected.name, content_type: selected.type || 'application/octet-stream', size: selected.size }) });
         const sdata = await parseResponse(sess);
         if (!sess.ok) throw new Error(sdata.detail || `Could not start upload (${sess.status})`);
-        await putWithProgress(sdata.upload_url, selected, p => { btn.textContent = `Uploading… ${Math.round(p*100)}%`; });
-        btn.textContent = 'Analyzing…';
+        await putWithProgress(sdata.upload_url, selected, p => setProgress('uploading', p * 0.25));
         const fd = new FormData();
         fd.append('object', sdata.object); fd.append('filename', selected.name);
         for (const [k, v] of Object.entries(params)) fd.append(k, v);
-        r = await fetch('/api/tag-object', { method: 'POST', body: fd });
+        data = await runStreaming('/api/tag-object-stream', fd);
       } else {
         const fd = new FormData();
         fd.append('file', selected);
         for (const [k, v] of Object.entries(params)) fd.append(k, v);
-        r = await fetch('/api/tag', { method: 'POST', body: fd });
+        data = await runStreaming('/api/tag-stream', fd);
       }
-      const data = await parseResponse(r);
+      setProgress('done', 1);
       $('result').hidden = false;
-      if (!r.ok) { $('meta').innerHTML = `<span class="err">Error ${r.status}: ${data.detail || JSON.stringify(data)}</span>`; $('tags').innerHTML=''; $('segments').hidden = true; $('json').textContent = JSON.stringify(data, null, 2); return; }
       $('meta').textContent = `${data.filename} · ${data.duration_seconds}s audio · ${data.model} · processed in ${data.processing_seconds}s` + (data.truncated_to_seconds ? ` · analysed first ${data.truncated_to_seconds}s` : '') + (data.aggregation === 'mean_over_segments' ? ' · overall tags are averaged over segments' : '');
       renderTags($('tags'), data.tags);
       if (data.segments) {
@@ -275,7 +340,7 @@
       $('json').textContent = JSON.stringify(data, null, 2);
     } catch (e) {
       $('result').hidden = false; $('meta').innerHTML = `<span class="err">${e.message || e}</span>`; $('tags').innerHTML=''; $('segments').hidden = true;
-    } finally { btn.disabled = false; btn.textContent = 'Analyze'; }
+    } finally { btn.disabled = false; btn.textContent = 'Analyze'; setTimeout(() => { $('progress').hidden = true; }, 1200); }
   });
 </script>
 </body>

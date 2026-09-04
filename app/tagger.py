@@ -3,6 +3,7 @@
 Wraps the PANNs models in ``pytorch/models.py`` so they can be loaded once at
 process start and reused across HTTP requests.
 """
+import logging
 import os
 import shutil
 import subprocess
@@ -13,6 +14,8 @@ from typing import Dict, List, Optional
 import numpy as np
 import soundfile
 import torch
+
+log = logging.getLogger("audiotagging.tagger")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "pytorch"))
@@ -171,6 +174,21 @@ class AudioTagger:
         out = self.sed_model(x, None)
         return out["framewise_output"].cpu().numpy()
 
+    def framewise(self, waveform: np.ndarray, cache: Optional[dict] = None) -> Optional[np.ndarray]:
+        """Frame-level probabilities, computed once and reused.
+
+        The timeline and the breakdown table both need this pass; without the
+        cache a request asking for both pays for the whole file twice.
+        """
+        if self.sed_model is None:
+            return None
+        if cache is not None and "framewise" in cache:
+            return cache["framewise"]
+        result = self._forward_framewise(waveform[None, :])[0]
+        if cache is not None:
+            cache["framewise"] = result
+        return result
+
     def _label_group_indices(self, substrings, exact=frozenset()) -> List[int]:
         subs = [x.lower() for x in substrings]
         return [i for i, label in enumerate(self.labels)
@@ -206,6 +224,7 @@ class AudioTagger:
         merge_gap_seconds: float = 0.5,
         min_event_seconds: float = 0.15,
         max_events: int = 200,
+        cache: Optional[dict] = None,
     ) -> Optional[dict]:
         """Timestamped tags at roughly 10 ms resolution using the frame-level
         (sound event detection) model, if one was loaded.
@@ -222,7 +241,7 @@ class AudioTagger:
             return None
 
         duration = waveform.shape[0] / self.sample_rate
-        framewise = self._forward_framewise(waveform[None, :])[0]  # (frames, classes)
+        framewise = self.framewise(waveform, cache)  # (frames, classes)
         frames_per_second = self.sample_rate / self.hop_size
         n_frames = framewise.shape[0]
 
@@ -353,7 +372,7 @@ class AudioTagger:
             return None
 
         duration = waveform.shape[0] / self.sample_rate
-        framewise = self._forward_framewise(waveform[None, :])[0]
+        framewise = self.framewise(waveform, cache)
         frames_per_second = self.sample_rate / self.hop_size
 
         speech_idx = self._label_group_indices(
@@ -414,6 +433,32 @@ class AudioTagger:
         "Wind": "Wind", "Rain": "Rain", "Thunder": "Weather",
     }
 
+    def _delivery_metrics(self, clip: np.ndarray, text: str, duration: float,
+                           pause_before: float) -> dict:
+        """Loudness, pitch and pace, measured from the waveform."""
+        metrics = {"pause_before": max(0.0, pause_before)}
+        if clip.size:
+            rms = float(np.sqrt(np.mean(np.square(clip, dtype=np.float64))))
+            metrics["loudness_dbfs"] = round(20 * np.log10(max(rms, 1e-9)), 1)
+        words = len([w for w in text.split() if w.strip()])
+        metrics["words"] = words
+        if duration > 0 and words:
+            metrics["words_per_minute"] = round(words / duration * 60, 1)
+        try:
+            import librosa
+
+            if clip.size >= self.sample_rate // 8:
+                f0 = librosa.yin(np.asarray(clip, dtype=np.float32), fmin=65, fmax=400,
+                                 sr=self.sample_rate)
+                voiced = f0[np.isfinite(f0)]
+                if voiced.size:
+                    metrics["pitch_hz_median"] = round(float(np.median(voiced)), 1)
+                    metrics["pitch_hz_range"] = round(
+                        float(np.percentile(voiced, 90) - np.percentile(voiced, 10)), 1)
+        except Exception:
+            pass
+        return metrics
+
     def build_breakdown_table(
         self,
         waveform: np.ndarray,
@@ -425,6 +470,8 @@ class AudioTagger:
         min_turn_seconds: float = 0.4,
         min_event_seconds: float = 0.15,
         max_rows: int = 300,
+        cache: Optional[dict] = None,
+        progress=None,
     ) -> Optional[List[dict]]:
         """A production-style breakdown: one row per speech turn *and* per
         notable sound event, sorted by time.
@@ -438,7 +485,7 @@ class AudioTagger:
             return None
 
         duration = waveform.shape[0] / self.sample_rate
-        framewise = self._forward_framewise(waveform[None, :])[0]
+        framewise = self.framewise(waveform, cache)
         frames_per_second = self.sample_rate / self.hop_size
 
         speech_idx = self._label_group_indices(
@@ -451,12 +498,13 @@ class AudioTagger:
             np.zeros(framewise.shape[0], dtype=bool)
         turns = self._merge_runs(speech_mask, frames_per_second, merge_gap_seconds, min_turn_seconds)
 
-        clips = []
-        for start_f, end_f in turns:
-            start_t, end_t = start_f / frames_per_second, min((end_f + 1) / frames_per_second, duration)
-            clips.append((waveform[int(start_t * self.sample_rate): int(end_t * self.sample_rate)],
-                          self.sample_rate))
+        spans = [(start_f / frames_per_second, min((end_f + 1) / frames_per_second, duration))
+                 for start_f, end_f in turns]
+        clips = [(waveform[int(a * self.sample_rate): int(b * self.sample_rate)], self.sample_rate)
+                 for a, b in spans]
 
+        if progress:
+            progress("diarizing", 0.0)
         speakers = [None] * len(turns)
         if diarizer is not None and clips:
             try:
@@ -464,10 +512,19 @@ class AudioTagger:
             except Exception:
                 speakers = [None] * len(turns)
 
+        if progress:
+            progress("transcribing", 0.0)
+        dialogue = [""] * len(turns)
+        if transcriber is not None and spans:
+            try:
+                dialogue = transcriber.transcribe_turns(waveform, self.sample_rate, spans)
+            except Exception:
+                log.exception("Transcription failed")
+
         rows = []
-        for (start_f, end_f), (clip, _), speaker in zip(turns, clips, speakers):
-            start_t = start_f / frames_per_second
-            end_t = min((end_f + 1) / frames_per_second, duration)
+        previous_end = 0.0
+        for (start_f, end_f), (start_t, end_t), (clip, _), speaker, text in zip(
+                turns, spans, clips, speakers, dialogue):
             window = framewise[start_f : end_f + 1]
             concurrent = window.max(axis=0).copy()
             concurrent[list(spoken_or_musical)] = 0.0
@@ -476,12 +533,17 @@ class AudioTagger:
                 "kind": "speech",
                 "start": round(start_t, 2),
                 "end": round(end_t, 2),
-                "dialogue": transcriber.transcribe(clip, self.sample_rate) if transcriber else "",
+                "dialogue": text,
                 "audio": "Music" if music_present else "",
                 "entity": speaker or "",
                 "confidence": round(float(window[:, speech_idx].max()), 3) if speech_idx else None,
                 "other_sounds": self._top_k(concurrent, 2, event_threshold),
+                # Measured delivery cues - useful as direction input, and unlike
+                # the interpretation column these are read off the waveform.
+                "measured": self._delivery_metrics(clip, text, end_t - start_t,
+                                                   round(start_t - previous_end, 2)),
             })
+            previous_end = end_t
 
         # --- sound events (non-speech, non-music) -------------------------
         above = framewise >= event_threshold
@@ -513,7 +575,10 @@ class AudioTagger:
             rows = speech_rows + event_rows[: max(0, max_rows - len(speech_rows))]
         rows.sort(key=lambda r: (r["start"], r["kind"] != "speech"))
 
+        if progress:
+            progress("assembling", 0.9)
         for row in rows:
+            row.setdefault("measured", {})
             row["interpretation"] = ""
             row["action"] = ""
             row["performance"] = ""
