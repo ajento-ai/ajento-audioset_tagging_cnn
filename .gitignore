@@ -1,6 +1,9 @@
 *
 !*/
 !*.*
+# The catch-all above ignores extension-less files, which would silently
+# leave the Dockerfile untracked.
+!Dockerfile
 *.hdf5
 *.pyc
 *.wav
